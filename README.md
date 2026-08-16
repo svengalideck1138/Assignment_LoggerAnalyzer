@@ -204,6 +204,26 @@ the list of module names outside the whitelist, and min/max speed values.
 The file starts with a UTF-8 BOM so Excel opens it correctly, and follows
 RFC 4180 quoting rules.
 
+## Measured Results (the provided 500MB log)
+
+Environment: server on a Raspberry Pi CM4 (eMMC 32GB, 8GB RAM, aarch64
+Linux), client on Windows 11 x64, wired LAN (~112MiB/s effective). Numbers
+are **self-reported by the server** in `ANALYZE_DONE` (elapsed time; peak
+RSS read from `/proc/self/status` VmHWM).
+
+| Metric | Required / recommended | Measured |
+|--------|------------------------|----------|
+| Peak server memory | ≤ 50MB recommended | **2.8 MiB** — about **1/17 of the budget** (2.3 MiB on a Wi-Fi re-run) |
+| Loading the whole 500MB into memory | forbidden | **never** — 1MiB chunks are parsed and discarded; nothing is written to disk either |
+| Lines completed | must finish every valid line | **3,483,502 of 3,483,528** — 26 corrupted lines (0.00075%) skipped, zero crashes |
+| Average speed (task 2) | — | **137500.000000** over 580,661 samples (without the module whitelist it would read 9.18×10¹⁵) |
+| Upload + analysis wall time | — | **~4.3s** on LAN — analysis streams with the upload, so it finishes when the upload does (110s on 4.4MiB/s Wi-Fi: time scales with bandwidth, memory does not) |
+| Memory leaks | zero (rule S2) | **0** — ASan/LeakSanitizer re-run on every push in CI |
+
+A requirement-by-requirement compliance matrix (every assignment item →
+implementation → evidence) is kept in
+[03.Docs/requirements-compliance.md](03.Docs/requirements-compliance.md).
+
 ## Network Architecture
 
 ### Overview
