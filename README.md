@@ -3,18 +3,38 @@
 A client-server system that uploads a large (~500MB) equipment log file over TCP,
 parses and aggregates it on the fly, and returns the analysis result as `result.csv`.
 
-- **Client**: Windows WinForms app (C#, .NET Framework 4.7.2) — file picker, upload, real-time progress, result download
+- **Clients (two implementations, same wire protocol)**
+  - C# WinForms app (Windows, .NET Framework 4.7.2)
+  - C++17 Dear ImGui app (cross-platform: builds on Windows and Linux from
+    the same sources) — persistent connection, status LED, built-in file
+    browser, live per-module statistics
 - **Server**: Linux daemon (C++17, libuv) — streaming parse/aggregation on receive, resident memory stays at a few MB
 
-![End-to-end demo — Linux server running over SSH (left) and the Windows client (right) uploading a log file and receiving result.csv](03.Docs/Screenshot.gif)
+<p align="center">
+  <img src="03.Docs/Screenshot-C%23.gif" alt="C# WinForms client — end-to-end demo with the Linux server (left: server over SSH, right: client)"><br>
+  <em>C# WinForms client (Windows) — uploading the 500MB log and receiving result.csv</em>
+</p>
+
+<p align="center">
+  <img src="03.Docs/Screenshot-C++.gif" alt="C++ ImGui client — persistent connection, live statistics, result download"><br>
+  <em>C++ ImGui client (cross-platform) — persistent connection, live per-module statistics</em>
+</p>
 
 ## Repository Layout
 
 ```
 Assignment_LoggerAnalyzer/
 ├── 01.Sources/
-│   ├── CLIENT/                  # WinForms client source (Visual Studio solution)
-│   │   └── Network/             # TCP layer (Protocol.cs = same wire contract as the server)
+│   ├── CLIENT/
+│   │   ├── CSHARP/              # WinForms client (Visual Studio solution)
+│   │   │   └── Network/         # TCP layer (Protocol.cs = same wire contract as the server)
+│   │   └── CPP/                 # cross-platform ImGui client (CMake project)
+│   │       ├── build_windows.bat    # VS2022 build
+│   │       ├── build_linux.sh       # Linux build (checks X11/OpenGL deps)
+│   │       ├── 3rdparty/        # Dear ImGui 1.92 + GLFW 3.4, vendored as source only
+│   │       └── src/
+│   │           ├── net/         # RAII sockets, worker-thread transfer engine
+│   │           └── ui/          # ImGui panels, built-in file browser
 │   └── SERVER/                  # Linux server source (CMake project)
 │       ├── 01.PreInstallation.sh    # 1) install build tools, SSH, firewall setup
 │       ├── 02.build_project_linux.sh # 2) build libuv + build server + run
@@ -48,6 +68,10 @@ chmod +x Zhenyu_LoggerAnalyzer
 
 Run `02.Release/release - client/Individual Assignment01_UI.exe`,
 enter the server IP and port (default 8088), and connect.
+
+> The cross-platform C++ ImGui client has no prebuilt binary yet — build it
+> in about a minute; see
+> [Client — C++ ImGui](#client--c-imgui-windows-and-linux) below.
 
 > If the server runs on another machine, open TCP port 8088 in its firewall
 > (`01.PreInstallation.sh` sets up the ufw rule automatically).
@@ -92,10 +116,39 @@ bash 03.DaemonRegistration.sh         # (optional) register systemd service: sta
 | `--pidfile <path>` | daemon PID file (default /tmp/Zhenyu_LoggerAnalyzer.pid) |
 | `-v, --verbose` | debug-level logging |
 
-### Client (Windows)
+### Client — C# WinForms (Windows)
 
-Open `01.Sources/CLIENT/Individual Assignment01_UI.sln` in Visual Studio 2022
-and build (.NET Framework 4.7.2).
+Open `01.Sources/CLIENT/CSHARP/Individual Assignment01_UI.sln` in
+Visual Studio 2022 and build (.NET Framework 4.7.2).
+
+### Client — C++ ImGui (Windows and Linux)
+
+The same sources build on both platforms. Dear ImGui and GLFW are vendored
+as **source only** (no prebuilt binaries), so any glibc or architecture
+compiles them locally, and the wire protocol comes from including the
+server's `Protocol.h` directly — one header, zero drift.
+
+**Windows** (Visual Studio 2022 with the C++ workload):
+
+```bat
+cd 01.Sources\CLIENT\CPP
+build_windows.bat
+```
+
+**Linux** (needs X11/OpenGL dev packages once):
+
+```bash
+sudo apt-get install -y build-essential cmake xorg-dev libgl1-mesa-dev
+# or: bash ../../SERVER/01.PreInstallation.sh --with-client-gui
+```
+
+```bash
+cd 01.Sources/CLIENT/CPP
+bash build_linux.sh
+```
+
+Run `build/Release/Zhenyu_LoggerClient.exe` (Windows) or
+`build/Zhenyu_LoggerClient` (Linux, from a desktop session).
 
 ## Analysis Tasks and result.csv
 
@@ -128,11 +181,11 @@ RFC 4180 quoting rules.
 
 ```mermaid
 flowchart LR
-    subgraph WIN["Windows client (C#, WinForms)"]
+    subgraph WIN["Client — C# WinForms · C++ ImGui"]
         direction TB
-        UI["Form1 — UI thread<br/>file picker · progress bar · result download"]
-        CONN["ServerConnection<br/>async/await non-blocking I/O"]
-        PROT_C["Protocol.cs<br/>16-byte header encode/decode"]
+        UI["UI thread<br/>file picker · progress bar · result download<br/>(Form1 / ImGui App)"]
+        CONN["Transfer engine<br/>C#: async/await · C++: worker thread + poll"]
+        PROT_C["Wire protocol<br/>C#: Protocol.cs · C++: includes server Protocol.h"]
         UI --> CONN --> PROT_C
     end
 
@@ -157,8 +210,10 @@ parse/aggregate layers only through `ISessionCallback` / `IPayloadSink`.
 
 ### Wire Protocol
 
-`src/net/Protocol.h` on the server is the single source of truth;
-`Network/Protocol.cs` on the client implements the same contract.
+`src/net/Protocol.h` on the server is the single source of truth.
+The C# client mirrors the contract in `Network/Protocol.cs`; the C++ client
+goes one step further and **includes the server header directly** (enforced
+by its CMake configure step), so client and server can never drift apart.
 
 - Frame = **16-byte fixed header + payload**, all integers big-endian
 - Header: magic `0x42594441 ("BYDA")` · version · msg_type · flags · payload_len (8B)
@@ -209,15 +264,21 @@ sequenceDiagram
   `ITcpServer` / `ISessionCallback` / `IPayloadSink` interfaces, so swapping
   the transport implementation never touches `main.cpp`
 
-### Client: async/await Non-blocking I/O
+### Clients: the UI Thread Never Blocks
 
-- Connecting, sending, and receiving all run on `async/await` non-blocking
-  I/O, so the **UI thread never freezes** during a 500MB upload
-  (no "Not Responding" state)
-- UI components: file picker, upload button, real-time progress bar,
+Both clients keep the UI responsive through a 500MB upload
+(no "Not Responding" state), each with the idiomatic tool of its stack:
+
+- **C# WinForms**: all I/O is `async/await`; the connect timeout is a
+  `Task.WhenAny` race whose losing task is always cleaned up
+- **C++ ImGui**: a dedicated worker thread owns the socket (non-blocking +
+  `poll`, 250ms cancel slices, 20s write-stall detection); the UI copies a
+  mutex-guarded snapshot each frame, so no torn values ever render
+- The C++ client keeps a **persistent session**: Connect/Disconnect toggle,
+  repeated uploads over one connection, a status LED (200ms blink while
+  connected/busy, PWM-style breathe on failure), and local-time-stamped logs
+- UI components on both: file picker, upload button, real-time progress bar,
   result download button
-- The connect timeout is implemented as a `Task.WhenAny` race, and the
-  losing task is always cleaned up
 
 ### Network Robustness
 
@@ -286,7 +347,8 @@ processed no matter how many corrupted lines appear.
 The assignment's strict rule (no manual memory management anywhere) is met.
 
 - **Zero** occurrences of `new` / `delete` / `malloc` / `free` / `calloc` /
-  `realloc` in the server source (`src/`, excluding bundled 3rdparty)
+  `realloc` in first-party C++ sources — both the server (`SERVER/src/`)
+  and the C++ client (`CLIENT/CPP/src/`), excluding bundled 3rdparty
 - All dynamic resources are owned by `std::unique_ptr`
   (`std::make_unique`) and STL containers (`std::vector`, `std::string`,
   `std::array`)
@@ -309,5 +371,6 @@ The assignment's strict rule (no manual memory management anywhere) is met.
 | Part | Technology |
 |------|------------|
 | Server | C++17, libuv 1.51.0 (statically linked), spdlog, CMake 3.15+ |
-| Client | C#, .NET Framework 4.7.2, WinForms |
+| Client (C#) | C#, .NET Framework 4.7.2, WinForms |
+| Client (C++) | C++17, Dear ImGui 1.92, GLFW 3.4, OpenGL 3, CMake 3.16+ |
 | Deployment | systemd service, automated shell scripts |
