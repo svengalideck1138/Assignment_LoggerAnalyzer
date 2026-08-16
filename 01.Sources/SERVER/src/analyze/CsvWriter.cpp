@@ -55,7 +55,13 @@ std::string fixed4(double v) {
 std::string utc_now() {
     const std::time_t t = std::time(nullptr);
     struct tm g;
+    // gmtime_r 은 POSIX 전용이다. 이 파일은 유닛 테스트를 통해
+    // Windows 에서도 컴파일되므로 양쪽 이름을 갈라 쓴다.
+#ifdef _WIN32
+    gmtime_s(&g, &t);
+#else
     ::gmtime_r(&t, &g);
+#endif
     std::array<char, 32> b{};
     std::strftime(b.data(), b.size(), "%Y-%m-%dT%H:%M:%SZ", &g);
     return std::string(b.data());
