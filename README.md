@@ -48,8 +48,10 @@ Assignment_LoggerAnalyzer/
 │           ├── analyze/         # aggregation, CSV result generation
 │           └── util/            # spdlog-based logger
 └── 02.Release/
-    ├── release - client/        # prebuilt Windows client (.exe)
-    └── release - server/        # prebuilt Linux server (x86_64) + service file
+    ├── release - client/
+    │   ├── CSHARP/              # prebuilt Windows client (.exe)
+    │   └── CPP/linux-aarch64/   # prebuilt Linux ImGui client (aarch64)
+    └── release - server/        # prebuilt Linux server (aarch64) + service file
 ```
 
 ## Quick Start (prebuilt binaries)
@@ -64,13 +66,28 @@ chmod +x Zhenyu_LoggerAnalyzer
 ./Zhenyu_LoggerAnalyzer --port 8088 --verbose
 ```
 
-**Client (Windows):**
+**Client (Windows, C# WinForms):**
 
-Run `02.Release/release - client/Individual Assignment01_UI.exe`,
+Run `02.Release/release - client/CSHARP/Individual Assignment01_UI.exe`,
 enter the server IP and port (default 8088), and connect.
 
-> The cross-platform C++ ImGui client has no prebuilt binary yet — build it
-> in about a minute; see
+**Client (Linux, C++ ImGui):**
+
+```bash
+cd "02.Release/release - client/CPP/linux-aarch64"
+chmod +x Zhenyu_LoggerClient
+./Zhenyu_LoggerClient
+```
+
+> Run it from a desktop session — it opens a window. The binary links against
+> the system OpenGL and libstdc++, so no extra packages are needed to run it.
+
+> The prebuilt Linux binaries are aarch64 (built on Raspberry Pi OS, glibc
+> 2.38). On any other architecture or an older glibc, build from source — the
+> build scripts install what they need; see below.
+
+> There is no prebuilt Windows binary for the C++ client yet — build it in
+> about a minute; see
 > [Client — C++ ImGui](#client--c-imgui-windows-and-linux) below.
 
 > If the server runs on another machine, open TCP port 8088 in its firewall
@@ -135,17 +152,27 @@ cd 01.Sources\CLIENT\CPP
 build_windows.bat
 ```
 
-**Linux** (needs X11/OpenGL dev packages once):
+**Linux:**
+
+```bash
+cd 01.Sources/CLIENT/CPP
+bash build_linux.sh
+```
+
+The script checks for the C++ toolchain, CMake and the X11/OpenGL development
+headers, and installs whatever is missing through apt / dnf / pacman (it asks
+for your sudo password). `SKIP_DEPS=1` checks only and stops instead. To
+install them yourself beforehand:
 
 ```bash
 sudo apt-get install -y build-essential cmake xorg-dev libgl1-mesa-dev
 # or: bash ../../SERVER/01.PreInstallation.sh --with-client-gui
 ```
 
-```bash
-cd 01.Sources/CLIENT/CPP
-bash build_linux.sh
-```
+GLFW is built with the X11 backend only, because its Wayland backend also
+needs `wayland-scanner` and `wayland-protocols`. The X11 build runs on a
+Wayland session through XWayland; pass `-DGLFW_BUILD_WAYLAND=ON` to CMake for
+a native Wayland build.
 
 Run `build/Release/Zhenyu_LoggerClient.exe` (Windows) or
 `build/Zhenyu_LoggerClient` (Linux, from a desktop session).
