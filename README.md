@@ -56,15 +56,24 @@ enter the server IP and port (default 8088), and connect.
 
 ### Server (Linux)
 
-After `git clone`, run the numbered scripts in order:
+After `git clone`, run the scripts in this order:
 
 ```bash
 cd 01.Sources/SERVER
-bash 01.PreInstallation.sh        # once: install packages + SSH/firewall setup
-bash 02.build_project_linux.sh    # build libuv -> build server -> run
-bash 03.DaemonRegistration.sh     # (optional) register systemd service: start at boot + auto-restart
+bash 01.PreInstallation.sh            # once: install packages + SSH/firewall setup
+bash 3rdparty/libuv/build_linux.sh    # once per machine: build bundled libuv against the local glibc
+bash 02.build_project_linux.sh        # build server -> run
+bash 03.DaemonRegistration.sh         # (optional) register systemd service: start at boot + auto-restart
 ```
 
+- **Why build libuv first**: the repository ships a prebuilt `libuv_a.a`,
+  but a static archive is tied to the glibc of the machine that built it.
+  Rebuilding it locally (a few minutes, once per machine) guarantees the
+  link succeeds. If you skip this step and the glibc versions differ, the
+  final link fails with errors like
+  `undefined reference to '__isoc23_strtol'` — the fix is to run the
+  libuv build script (or `REBUILD_LIBUV=1 bash 02.build_project_linux.sh`,
+  which does the same thing)
 - Supported distros: Debian family (apt), RHEL family (dnf), Arch family (pacman) / x86_64, aarch64
 - Build options via environment variables: `BUILD_TYPE=Debug`, `SANITIZE=address`, `NO_RUN=1`, `PORT=8090`, etc.
 - libstdc++/libgcc are statically linked, so the binary runs even when the build
