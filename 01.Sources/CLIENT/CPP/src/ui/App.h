@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-#include "../net/Transfer.hpp"
-#include "FileBrowser.hpp"
+#include "../net/Transfer.h"
+#include "FileBrowser.h"
 
 namespace bydacli {
 

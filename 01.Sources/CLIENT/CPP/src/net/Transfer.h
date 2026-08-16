@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-#include "Socket.hpp"
+#include "Socket.h"
 
 namespace bydacli {
 
