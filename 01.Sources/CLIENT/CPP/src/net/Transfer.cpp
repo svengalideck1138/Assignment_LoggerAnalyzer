@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 
@@ -29,12 +30,35 @@ constexpr std::uint64_t kMaxCsvBytes = 64ull * 1024 * 1024;
 // 접속 제한 시간.
 constexpr int kConnectTimeoutMs = 5000;
 
+// 유휴 루프에서 명령을 기다리는 슬라이스. 이 주기로 소켓 생존도 살핀다.
+constexpr int kIdleSliceMs = 200;
+
 // CANCEL/BYE 처럼 취소 중에도 보내야 하는 프레임이 쓰는 '취소 없음' 플래그.
 const std::atomic<bool> g_never_cancel{false};
 
 std::int64_t now_ms() noexcept {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// 로컬 시각 "[HH:MM:SS.mmm] " 접두어.
+std::string local_time_prefix() {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const std::time_t tt = system_clock::to_time_t(now);
+    const int ms = static_cast<int>(
+        duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000);
+
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &tt);
+#else
+    localtime_r(&tt, &local);
+#endif
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ", local.tm_hour, local.tm_min,
+                  local.tm_sec, ms);
+    return buf;
 }
 
 }  // namespace
@@ -60,6 +84,7 @@ const char* phase_text(Phase p) noexcept {
         case Phase::Idle: return "idle";
         case Phase::Connecting: return "connecting";
         case Phase::Handshaking: return "handshaking";
+        case Phase::Connected: return "connected";
         case Phase::Uploading: return "uploading";
         case Phase::WaitingAnalysis: return "waiting for analysis";
         case Phase::ReceivingResult: return "receiving result";
@@ -72,44 +97,46 @@ const char* phase_text(Phase p) noexcept {
 
 TransferClient::~TransferClient() {
     request_cancel();
+    disconnect();
     if (worker_.joinable()) {
         worker_.join();
     }
 }
 
-bool TransferClient::begin_job() {
+void TransferClient::connect(std::string host, std::uint16_t port,
+                             std::string client_name) {
     bool expected = false;
     if (!busy_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        return false;  // 이미 작업이 실행 중이다
+        return;  // 세션이 이미 살아 있다
     }
     if (worker_.joinable()) {
         worker_.join();  // 끝난 이전 스레드를 회수한다
     }
     cancel_.store(false, std::memory_order_relaxed);
-
-    std::lock_guard<std::mutex> lk(mu_);
-    state_ = Snapshot{};
-    return true;
-}
-
-void TransferClient::finish_job() { busy_.store(false, std::memory_order_release); }
-
-void TransferClient::start_probe(std::string host, std::uint16_t port,
-                                 std::string client_name) {
-    if (!begin_job()) {
-        return;
+    {
+        std::lock_guard<std::mutex> lk(cmd_mu_);
+        cmd_ = Cmd::None;
+        cmd_file_.clear();
     }
-    worker_ = std::thread(&TransferClient::run_probe, this, std::move(host), port,
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        state_ = Snapshot{};
+    }
+    worker_ = std::thread(&TransferClient::run_session, this, std::move(host), port,
                           std::move(client_name));
 }
 
-void TransferClient::start_upload(std::string host, std::uint16_t port,
-                                  std::string client_name, std::string file_path) {
-    if (!begin_job()) {
-        return;
-    }
-    worker_ = std::thread(&TransferClient::run_upload, this, std::move(host), port,
-                          std::move(client_name), std::move(file_path));
+void TransferClient::disconnect() {
+    std::lock_guard<std::mutex> lk(cmd_mu_);
+    cmd_ = Cmd::Disconnect;
+    cmd_cv_.notify_all();
+}
+
+void TransferClient::start_upload(std::string file_path) {
+    std::lock_guard<std::mutex> lk(cmd_mu_);
+    cmd_ = Cmd::Upload;
+    cmd_file_ = std::move(file_path);
+    cmd_cv_.notify_all();
 }
 
 Snapshot TransferClient::snapshot() const {
@@ -130,9 +157,14 @@ void TransferClient::set_phase(Phase p) {
     state_.phase = p;
 }
 
+void TransferClient::set_connected(bool on) {
+    std::lock_guard<std::mutex> lk(mu_);
+    state_.connected = on;
+}
+
 void TransferClient::log(const std::string& line) {
     std::lock_guard<std::mutex> lk(mu_);
-    log_.push_back(line);
+    log_.push_back(local_time_prefix() + line);
     // UI 가 오래 안 가져가도 무한히 자라지 않게 한다.
     while (log_.size() > 2000) {
         log_.pop_front();
@@ -143,6 +175,7 @@ void TransferClient::fail(const std::string& why) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         state_.phase = Phase::Failed;
+        state_.connected = false;
         state_.error = why;
     }
     log("[ERROR] " + why);
@@ -261,10 +294,10 @@ bool TransferClient::handshake(TcpSocket& sock, const std::string& client_name,
     return true;
 }
 
-// ------------------------------------------------------------------- probe
+// ------------------------------------------------------------ session loop
 
-void TransferClient::run_probe(std::string host, std::uint16_t port,
-                               std::string client_name) {
+void TransferClient::run_session(std::string host, std::uint16_t port,
+                                 std::string client_name) {
     set_phase(Phase::Connecting);
     log("connecting to " + host + ":" + std::to_string(port) + " ...");
 
@@ -272,19 +305,71 @@ void TransferClient::run_probe(std::string host, std::uint16_t port,
     std::string err;
     if (!sock.connect(host, port, kConnectTimeoutMs, cancel_, err)) {
         fail(err);
-        finish_job();
+        busy_.store(false, std::memory_order_release);
         return;
     }
     if (!handshake(sock, client_name, err)) {
         fail(err);
-        finish_job();
+        busy_.store(false, std::memory_order_release);
         return;
     }
 
-    (void)send_frame(sock, byda::MsgType::Bye, {}, err);
-    log("-> BYE               (connection test only)");
-    set_phase(Phase::Done);
-    finish_job();
+    set_connected(true);
+    set_phase(Phase::Connected);
+
+    // ---- 명령 루프: 업로드 / 해제 요청과 소켓 생존을 함께 살핀다 ----
+    bool alive = true;
+    while (alive) {
+        Cmd cmd = Cmd::None;
+        std::string file;
+        {
+            std::unique_lock<std::mutex> lk(cmd_mu_);
+            cmd_cv_.wait_for(lk, std::chrono::milliseconds(kIdleSliceMs),
+                             [this] { return cmd_ != Cmd::None; });
+            cmd = cmd_;
+            file = cmd_file_;
+            cmd_ = Cmd::None;
+            cmd_file_.clear();
+        }
+
+        if (cmd == Cmd::Disconnect) {
+            (void)send_frame(sock, byda::MsgType::Bye, {}, err);
+            log("-> BYE               disconnected");
+            break;
+        }
+
+        if (cmd == Cmd::Upload) {
+            cancel_.store(false, std::memory_order_relaxed);
+            alive = do_upload(sock, file);
+            continue;
+        }
+
+        // 유휴: 서버가 보낸 것이 있으면 소화한다 (종료 통보, EOF 등).
+        while (alive && sock.readable_now()) {
+            Frame f;
+            if (!read_frame(sock, f, 5000, err)) {
+                fail("connection lost: " + err);
+                alive = false;
+                break;
+            }
+            if (f.type == byda::MsgType::Error) {
+                fail(server_error_text(f.payload));
+                alive = false;
+            } else {
+                log(std::string("<- ") + byda::msg_name(f.type) + " (ignored while idle)");
+            }
+        }
+    }
+
+    sock.close();
+    set_connected(false);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (state_.phase != Phase::Failed) {
+            state_.phase = Phase::Idle;
+        }
+    }
+    busy_.store(false, std::memory_order_release);
 }
 
 // ------------------------------------------------------------------ upload
@@ -333,8 +418,6 @@ void TransferClient::send_cancel_and_wait(TcpSocket& sock) {
     const std::int64_t deadline = now_ms() + kCancelAckTimeoutMs;
     while (now_ms() < deadline) {
         Frame f;
-        // 취소 플래그가 이미 서 있으므로 '취소 없음' recv 경로가 필요하다.
-        // read_frame 은 cancel_ 을 쓰므로 여기서는 소켓을 직접 읽는다.
         byda::HeaderBytes head{};
         std::string e2;
         const int left = static_cast<int>(deadline - now_ms());
@@ -363,46 +446,41 @@ void TransferClient::send_cancel_and_wait(TcpSocket& sock) {
     }
 }
 
-void TransferClient::run_upload(std::string host, std::uint16_t port,
-                                std::string client_name, std::string file_path) {
+bool TransferClient::do_upload(TcpSocket& sock, const std::string& file_path) {
     namespace fs = std::filesystem;
+
+    // 새 업로드: 이전 결과/진행 표시를 지우되 연결 정보는 유지한다.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const HelloInfo hello = state_.hello;
+        const bool connected = state_.connected;
+        Snapshot fresh;
+        fresh.hello = hello;
+        fresh.hello_valid = true;
+        fresh.connected = connected;
+        state_ = std::move(fresh);
+    }
 
     // ---- 0) 파일 확인 ----
     std::error_code ec;
     const std::uint64_t total = fs::file_size(fs::u8path(file_path), ec);
     if (ec) {
-        fail("cannot read file: " + file_path);
-        finish_job();
-        return;
+        set_phase(Phase::Connected);
+        log("[ERROR] cannot read file: " + file_path);
+        return true;  // 연결은 멀쩡하다
     }
     const std::string file_name = fs::u8path(file_path).filename().u8string();
 
-    // ---- 1) 접속 + 핸드셰이크 ----
-    set_phase(Phase::Connecting);
-    log("connecting to " + host + ":" + std::to_string(port) + " ...");
-
-    TcpSocket sock;
     std::string err;
-    if (!sock.connect(host, port, kConnectTimeoutMs, cancel_, err)) {
-        fail(err);
-        finish_job();
-        return;
-    }
-    if (!handshake(sock, client_name, err)) {
-        fail(err);
-        finish_job();
-        return;
-    }
 
-    // ---- 2) UPLOAD_BEGIN ----
+    // ---- 1) UPLOAD_BEGIN ----
     {
         PayloadWriter w;
         w.u64(total);
         w.str16(file_name);
         if (!send_frame(sock, byda::MsgType::UploadBegin, w.bytes(), err)) {
             fail(err);
-            finish_job();
-            return;
+            return false;
         }
     }
     log("-> UPLOAD_BEGIN      " + file_name + "  " + human_bytes(total));
@@ -410,19 +488,16 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
     Frame ack;
     if (!read_frame(sock, ack, kIdleTimeoutMs, err)) {
         fail(err);
-        finish_job();
-        return;
+        return false;
     }
     if (ack.type == byda::MsgType::Error) {
         fail(server_error_text(ack.payload));
-        finish_job();
-        return;
+        return false;
     }
     if (ack.type != byda::MsgType::UploadBeginAck) {
         fail(std::string("expected UPLOAD_BEGIN_ACK but received ") +
              byda::msg_name(ack.type));
-        finish_job();
-        return;
+        return false;
     }
 
     std::uint32_t upload_id = 0, chunk_size = 0;
@@ -431,8 +506,7 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
         PayloadReader r(ack.payload);
         if (!r.u32(upload_id) || !r.u32(chunk_size)) {
             fail("malformed UPLOAD_BEGIN_ACK payload");
-            finish_job();
-            return;
+            return false;
         }
         if (chunk_size == 0 || chunk_size > 4u * 1024 * 1024) {
             chunk_size = 1024 * 1024;
@@ -461,14 +535,13 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
         state_.module_counts.assign(module_names.size(), 0);
     }
 
-    // ---- 3) UPLOAD_CHUNK 반복 ----
+    // ---- 2) UPLOAD_CHUNK 반복 ----
     set_phase(Phase::Uploading);
 
     std::ifstream file(fs::u8path(file_path), std::ios::binary);
     if (!file) {
         fail("cannot open file: " + file_path);
-        finish_job();
-        return;
+        return false;
     }
 
     // 헤더 16바이트 + 데이터를 한 버퍼에 담아 send 한 번으로 보낸다.
@@ -487,8 +560,7 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
             send_cancel_and_wait(sock);
             set_phase(Phase::Cancelled);
             log("upload cancelled by user");
-            finish_job();
-            return;
+            return true;  // 서버는 세션을 Ready 로 되돌린다. 연결 유지.
         }
 
         file.read(reinterpret_cast<char*>(buf.data() + byda::kHeaderSize),
@@ -511,11 +583,10 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
                 send_cancel_and_wait(sock);
                 set_phase(Phase::Cancelled);
                 log("upload cancelled by user");
-            } else {
-                fail(err);
+                return true;
             }
-            finish_job();
-            return;
+            fail(err);
+            return false;
         }
         sent += static_cast<std::uint64_t>(n);
 
@@ -525,15 +596,13 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
             Frame f;
             if (!read_frame(sock, f, 5000, err)) {
                 fail(err);
-                finish_job();
-                return;
+                return false;
             }
             if (f.type == byda::MsgType::UploadAck) {
                 apply_upload_ack(f);
             } else if (f.type == byda::MsgType::Error) {
                 fail(server_error_text(f.payload));
-                finish_job();
-                return;
+                return false;
             }
             // 그 밖의 메시지는 업로드 중에 올 이유가 없으므로 무시한다.
         }
@@ -563,35 +632,32 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
         }
     }
 
-    // ---- 4) UPLOAD_END ----
+    // ---- 3) UPLOAD_END ----
     {
         PayloadWriter w;
         w.u64(sent);
         if (!send_frame(sock, byda::MsgType::UploadEnd, w.bytes(), err)) {
             fail(err);
-            finish_job();
-            return;
+            return false;
         }
     }
     log("-> UPLOAD_END        " + human_bytes(sent) + " sent, waiting for the analysis");
     set_phase(Phase::WaitingAnalysis);
 
-    // ---- 5) ANALYZE_DONE 까지 남은 프레임을 소화한다 ----
+    // ---- 4) ANALYZE_DONE 까지 남은 프레임을 소화한다 ----
     std::uint64_t csv_size = 0;
     for (;;) {
         if (cancel_.load(std::memory_order_relaxed)) {
             send_cancel_and_wait(sock);
             set_phase(Phase::Cancelled);
             log("cancelled while waiting for the analysis");
-            finish_job();
-            return;
+            return true;
         }
 
         Frame f;
         if (!read_frame(sock, f, kIdleTimeoutMs, err)) {
             fail(err);
-            finish_job();
-            return;
+            return false;
         }
 
         if (f.type == byda::MsgType::UploadAck) {
@@ -600,8 +666,7 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
         }
         if (f.type == byda::MsgType::Error) {
             fail(server_error_text(f.payload));
-            finish_job();
-            return;
+            return false;
         }
         if (f.type == byda::MsgType::AnalyzeDone) {
             PayloadReader r(f.payload);
@@ -612,8 +677,7 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
                 !r.u64(oversize) || !r.u64(spd_n) || !r.str16(avg) || !r.u64(elapsed) ||
                 !r.u64(rss) || !r.u64(csv_size)) {
                 fail("malformed ANALYZE_DONE payload");
-                finish_job();
-                return;
+                return false;
             }
 
             {
@@ -650,23 +714,20 @@ void TransferClient::run_upload(std::string host, std::uint16_t port,
 
         fail(std::string("unexpected message while waiting for ANALYZE_DONE: ") +
              byda::msg_name(f.type));
-        finish_job();
-        return;
+        return false;
     }
 
-    // ---- 6) result.csv 수신 ----
+    // ---- 5) result.csv 수신 ----
     set_phase(Phase::ReceivingResult);
     if (!receive_result(sock, csv_size, err)) {
         fail(err);
-        finish_job();
-        return;
+        return false;
     }
 
-    // ---- 7) BYE ----
-    (void)send_frame(sock, byda::MsgType::Bye, {}, err);
+    // 서버는 세션을 Ready 로 되돌린다. 연결을 유지한 채 완료로 표시한다.
     set_phase(Phase::Done);
-    log("session finished");
-    finish_job();
+    log("upload finished, connection stays open");
+    return true;
 }
 
 bool TransferClient::receive_result(TcpSocket& sock, std::uint64_t expected_size,

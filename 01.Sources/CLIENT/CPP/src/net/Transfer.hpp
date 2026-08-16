@@ -1,17 +1,20 @@
-// Zhenyu_LoggerAnalyzer C++ client - 전송 엔진 (워커 스레드).
+// Zhenyu_LoggerAnalyzer C++ client - 전송 엔진 (워커 스레드, 상주 연결).
 //
 // 과제 요구사항 C2: 파일 전송은 반드시 워커 스레드로 처리하고,
 // 500MB 전송 중에도 UI 스레드가 멈추면 안 된다.
 //
-// 구조:
-//   - UI 스레드는 start_*() 로 작업을 시작하고, 매 프레임 snapshot() 으로
-//     진행 상황의 복사본을 읽어 그린다. 워커가 갱신 중인 객체를 직접
-//     보여주지 않으므로 찢어진 값이 화면에 나오지 않는다.
-//   - 취소는 원자 플래그 하나다. 워커는 청크 사이와 poll 슬라이스마다
-//     플래그를 보고, C# 클라이언트와 같은 순서로 CANCEL 을 보낸 뒤
-//     서버의 ERROR(Cancelled) 응답을 잠깐 기다린다.
-//   - 한 번에 하나의 작업만 실행된다. 이전 작업이 끝나기 전의 start 요청은
-//     무시된다.
+// 연결 모델:
+//   - Connect 하면 워커 스레드가 접속 + HELLO 핸드셰이크 후 '연결을 유지'
+//     하며 명령을 기다린다. 서버는 업로드가 끝나면 세션을 Ready 로
+//     되돌리므로 (TcpSession) 한 연결에서 여러 번 업로드할 수 있다.
+//   - Disconnect 는 BYE 를 보내고 소켓을 닫은 뒤 스레드를 끝낸다.
+//   - 유휴 중에도 소켓을 감시해서, 서버가 내려가거나(ERROR ShuttingDown)
+//     유휴 타임아웃으로 끊으면 즉시 '연결 끊김'으로 반영한다.
+//
+// 스레드 규칙:
+//   - UI 는 매 프레임 snapshot() 으로 복사본을 읽는다. 찢어진 값 없음.
+//   - 명령(업로드/해제)은 뮤텍스 + 조건변수 큐 하나로 전달한다.
+//   - 취소는 원자 플래그. 워커는 청크 사이와 poll 슬라이스마다 확인한다.
 //
 // 와이어 규약은 서버의 net/Protocol.h 를 그대로 include 한다.
 
@@ -20,6 +23,7 @@
 #include <net/Protocol.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -32,15 +36,16 @@
 namespace bydacli {
 
 enum class Phase {
-    Idle,
+    Idle,             // 연결 없음
     Connecting,
     Handshaking,
+    Connected,        // 연결 유지, 명령 대기
     Uploading,
     WaitingAnalysis,
     ReceivingResult,
-    Done,
-    Cancelled,
-    Failed,
+    Done,             // 연결 유지 중, 마지막 업로드 성공
+    Cancelled,        // 연결 유지 중, 마지막 업로드 취소됨
+    Failed,           // 연결 없음, error 에 사유
 };
 
 const char* phase_text(Phase p) noexcept;
@@ -56,6 +61,7 @@ struct HelloInfo {
 // UI 가 매 프레임 복사해 가는 진행 상황.
 struct Snapshot {
     Phase phase = Phase::Idle;
+    bool connected = false;
     std::string error;  // Failed 일 때의 사유
 
     HelloInfo hello;
@@ -87,7 +93,7 @@ struct Snapshot {
     std::uint64_t result_elapsed_ms = 0;
     std::uint64_t result_peak_rss_kb = 0;
 
-    // 수신한 result.csv 원문 (Done 이후에만 채워진다).
+    // 수신한 result.csv 원문 (업로드 성공 이후에만 채워진다).
     std::string csv;
 };
 
@@ -99,15 +105,18 @@ public:
     TransferClient(const TransferClient&) = delete;
     TransferClient& operator=(const TransferClient&) = delete;
 
-    // 접속 확인: connect + HELLO/HELLO_ACK + BYE. 결과는 snapshot 으로 본다.
-    void start_probe(std::string host, std::uint16_t port, std::string client_name);
+    // 접속하고 연결을 유지한다. 이미 세션이 살아 있으면 무시된다.
+    void connect(std::string host, std::uint16_t port, std::string client_name);
 
-    // 업로드 세션 전체: connect -> HELLO -> UPLOAD -> ANALYZE -> RESULT -> BYE.
-    void start_upload(std::string host, std::uint16_t port, std::string client_name,
-                      std::string file_path);
+    // BYE 를 보내고 연결을 끊는다.
+    void disconnect();
+
+    // 연결된 상태에서 업로드를 시작한다. 연결이 없으면 무시된다.
+    void start_upload(std::string file_path);
 
     void request_cancel() noexcept { cancel_.store(true, std::memory_order_relaxed); }
 
+    // 세션 워커가 살아 있는가 (연결 시도 중 포함).
     bool busy() const noexcept { return busy_.load(std::memory_order_acquire); }
 
     Snapshot snapshot() const;
@@ -121,9 +130,12 @@ private:
         std::vector<std::uint8_t> payload;
     };
 
-    void run_probe(std::string host, std::uint16_t port, std::string client_name);
-    void run_upload(std::string host, std::uint16_t port, std::string client_name,
-                    std::string file_path);
+    enum class Cmd { None, Upload, Disconnect };
+
+    void run_session(std::string host, std::uint16_t port, std::string client_name);
+
+    // false 를 돌려주면 연결이 죽었다는 뜻이다 (세션 루프 종료).
+    bool do_upload(TcpSocket& sock, const std::string& file_path);
 
     bool send_frame(TcpSocket& sock, byda::MsgType type,
                     const std::vector<std::uint8_t>& payload, std::string& err);
@@ -134,18 +146,20 @@ private:
     bool receive_result(TcpSocket& sock, std::uint64_t expected_size, std::string& err);
     void send_cancel_and_wait(TcpSocket& sock);
 
-    // 실패로 끝낸다. ERROR 프레임이면 서버 메시지를 사유로 쓴다.
     void fail(const std::string& why);
-
     void set_phase(Phase p);
+    void set_connected(bool on);
     void log(const std::string& line);
-
-    bool begin_job();      // busy_ 를 원자적으로 잡는다. 실패하면 이미 실행 중.
-    void finish_job();     // 스레드 join 준비 + busy_ 해제
 
     mutable std::mutex mu_;
     Snapshot state_;                    // mu_ 로 보호
     std::deque<std::string> log_;       // mu_ 로 보호
+
+    // ---- 명령 큐 (UI -> 워커) ----
+    std::mutex cmd_mu_;
+    std::condition_variable cmd_cv_;
+    Cmd cmd_ = Cmd::None;
+    std::string cmd_file_;
 
     std::thread worker_;
     std::atomic<bool> busy_{false};
