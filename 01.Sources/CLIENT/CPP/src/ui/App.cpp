@@ -403,7 +403,14 @@ void App::draw_result_section(const Snapshot& s, bool busy) {
 
     // 버튼 두 개는 고정 폭으로 오른쪽에 두고, 경로 입력이 남은 폭을 쓴다.
     // 창이 좁아져도 버튼 라벨이 잘리지 않는다.
-    const bool has_csv = !s.csv.empty() && !busy;
+    //
+    // 연결 유지(busy) 중에도 저장은 가능해야 한다. 잠그는 것은
+    // '실제 전송 중'일 때뿐이다 (전송이 csv 를 갈아끼우는 중이므로).
+    (void)busy;
+    const bool transferring = s.phase == Phase::Uploading ||
+                              s.phase == Phase::WaitingAnalysis ||
+                              s.phase == Phase::ReceivingResult;
+    const bool has_csv = !s.csv.empty() && !transferring;
     const float buttons_w = em(6.0f) + em(9.0f) + ImGui::GetStyle().ItemSpacing.x * 2;
     ImGui::BeginDisabled(!has_csv);
     ImGui::SetNextItemWidth(-buttons_w);
