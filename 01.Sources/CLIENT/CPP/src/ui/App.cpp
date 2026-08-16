@@ -1,4 +1,4 @@
-#include "App.hpp"
+#include "App.h"
 
 #include <imgui.h>
 
@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <fstream>
 
-#include "../net/Payload.hpp"
+#include "../net/Payload.h"
 
 namespace bydacli {
 

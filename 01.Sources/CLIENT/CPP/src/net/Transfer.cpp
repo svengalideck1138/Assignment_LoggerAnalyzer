@@ -1,4 +1,4 @@
-#include "Transfer.hpp"
+#include "Transfer.h"
 
 #include <chrono>
 #include <cstdio>
@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <fstream>
 
-#include "Payload.hpp"
+#include "Payload.h"
 
 namespace bydacli {
 namespace {
