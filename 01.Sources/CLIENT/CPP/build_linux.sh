@@ -43,6 +43,7 @@ if [ "$missing" -ne 0 ]; then
     echo
     echo "[ERROR] Install the build dependencies first:"
     echo "        sudo apt-get install -y build-essential cmake xorg-dev libgl1-mesa-dev"
+    echo "        (or: bash ../../SERVER/01.PreInstallation.sh --with-client-gui)"
     exit 1
 fi
 

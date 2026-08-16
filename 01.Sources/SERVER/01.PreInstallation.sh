@@ -14,6 +14,8 @@
 #
 # 옵션:
 #   --with-dev-tools   검증 도구(gdb, valgrind, strace)까지 설치
+#   --with-client-gui  C++ ImGui 클라이언트 빌드용 X11/OpenGL 개발 패키지까지 설치
+#                      (01.Sources/CLIENT/CPP 를 이 머신에서 빌드할 때만 필요)
 #   --no-ssh           openssh-server 설치와 활성화를 건너뛴다
 #   --no-firewall      ufw 설치와 방화벽 설정을 통째로 건너뛴다
 #   --port <n>         방화벽에서 열 서버 포트 (기본 8088)
@@ -27,6 +29,7 @@ set -u
 
 PORT=8088
 WITH_DEV_TOOLS=0
+WITH_CLIENT_GUI=0
 WITH_SSH=1
 WITH_FIREWALL=1
 ASSUME_YES=0
@@ -34,6 +37,7 @@ ASSUME_YES=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-dev-tools) WITH_DEV_TOOLS=1 ;;
+        --with-client-gui) WITH_CLIENT_GUI=1 ;;
         --no-ssh)         WITH_SSH=0 ;;
         --no-firewall)    WITH_FIREWALL=0 ;;
         --port)           shift; PORT="${1:-8088}" ;;
@@ -127,6 +131,7 @@ if [ "$ASSUME_YES" != "1" ]; then
     echo "The following will be installed / configured:"
     echo "  build toolchain (g++, make), cmake"
     [ "$WITH_DEV_TOOLS" = "1" ] && echo "  dev tools (gdb, valgrind, strace)"
+    [ "$WITH_CLIENT_GUI" = "1" ] && echo "  client GUI build deps (X11 + OpenGL dev headers)"
     [ "$WITH_SSH" = "1" ] && echo "  openssh-server, enabled at boot"
     if [ "$WITH_FIREWALL" = "1" ]; then
         echo "  ufw, with these rules, then enabled:"
@@ -164,6 +169,9 @@ case "$PKG" in
         if [ "$WITH_DEV_TOOLS" = "1" ]; then
             $SUDO apt-get install -y gdb valgrind strace
         fi
+        if [ "$WITH_CLIENT_GUI" = "1" ]; then
+            $SUDO apt-get install -y xorg-dev libgl1-mesa-dev
+        fi
         ;;
     dnf)
         # shellcheck disable=SC2086
@@ -171,12 +179,20 @@ case "$PKG" in
         if [ "$WITH_DEV_TOOLS" = "1" ]; then
             $SUDO dnf install -y gdb valgrind strace
         fi
+        if [ "$WITH_CLIENT_GUI" = "1" ]; then
+            $SUDO dnf install -y libX11-devel libXrandr-devel libXinerama-devel \
+                                 libXcursor-devel libXi-devel mesa-libGL-devel
+        fi
         ;;
     pacman)
         # shellcheck disable=SC2086
         $SUDO pacman -Sy --needed --noconfirm base-devel cmake $EXTRA
         if [ "$WITH_DEV_TOOLS" = "1" ]; then
             $SUDO pacman -Sy --needed --noconfirm gdb valgrind strace
+        fi
+        if [ "$WITH_CLIENT_GUI" = "1" ]; then
+            $SUDO pacman -Sy --needed --noconfirm libx11 libxrandr libxinerama \
+                                                  libxcursor libxi mesa
         fi
         ;;
 esac
@@ -311,6 +327,11 @@ echo "[4/4] Next step"
 echo
 echo "  Build and run the server (this also builds the bundled libuv for $ARCH):"
 echo "       bash 02.build_project_linux.sh"
+if [ "$WITH_CLIENT_GUI" = "1" ]; then
+    echo
+    echo "  Build the C++ ImGui client (run it from a desktop session):"
+    echo "       bash ../CLIENT/CPP/build_linux.sh"
+fi
 echo
 echo "======================================================="
 echo " [SUCCESS] Prerequisites are ready"
