@@ -24,7 +24,7 @@ public:
 
 private:
     void draw_server_section(const Snapshot& s, bool busy);
-    void draw_file_section(bool busy);
+    void draw_file_section(const Snapshot& s);
     void draw_transfer_section(const Snapshot& s, bool busy);
     void draw_result_section(const Snapshot& s, bool busy);
     void draw_log_section();
