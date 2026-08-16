@@ -1,0 +1,97 @@
+# 태그(v*)를 push 하면 실행되는 릴리스 파이프라인.
+#
+#   linux (x86_64 + aarch64 매트릭스) : 서버 + C++ 클라이언트 빌드, tar.gz 패키징
+#   windows                           : C++ 클라이언트 빌드 + 저장소의 C# 클라이언트 동봉, zip
+#   publish                           : SHA256SUMS 생성 후 GitHub Release 로 게시
+#
+# 사용법:
+#   git tag -a v1.0.0 -m "..." && git push origin v1.0.0
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # 릴리스 생성에 필요
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install client build deps
+        run: sudo apt-get update && sudo apt-get install -y xorg-dev libgl1-mesa-dev
+      - name: Build server
+        run: |
+          bash 01.Sources/SERVER/3rdparty/libuv/build_linux.sh
+          cmake -S 01.Sources/SERVER -B server-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build server-build -j
+      - name: Build C++ client
+        run: |
+          cmake -S 01.Sources/CLIENT/CPP -B client-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build client-build -j
+      - name: Package
+        run: |
+          PKG="Zhenyu_LoggerAnalyzer-${{ github.ref_name }}-linux-${{ matrix.arch }}"
+          mkdir -p "$PKG"
+          cp server-build/Zhenyu_LoggerAnalyzer "$PKG/"
+          cp client-build/Zhenyu_LoggerClient "$PKG/"
+          cp 01.Sources/SERVER/packaging/Zhenyu_LoggerAnalyzer.service "$PKG/"
+          tar czf "$PKG.tar.gz" "$PKG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: "*.tar.gz"
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build C++ client
+        run: |
+          cmake -S 01.Sources/CLIENT/CPP -B client-build
+          cmake --build client-build --config Release --parallel
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = "Zhenyu_LoggerAnalyzer-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Path $pkg | Out-Null
+          Copy-Item client-build/Release/Zhenyu_LoggerClient.exe $pkg/
+          # C# WinForms 클라이언트는 저장소의 검증된 프리빌트를 동봉한다.
+          Copy-Item "02.Release/release - client/CSHARP/*" $pkg/ -Recurse
+          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: "*.zip"
+
+  publish:
+    name: Publish GitHub Release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: assets
+      - name: Generate SHA256SUMS
+        run: cd assets && sha256sum * > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" assets/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

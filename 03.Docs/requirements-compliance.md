@@ -24,7 +24,7 @@ Legend — ✅ met / ⭐ exceeded
 
 | ID | Requirement | Status | Implementation · Evidence |
 |---|---|:--:|---|
-| S1 | No `new`/`delete`/`malloc`/`free`/`calloc`/`realloc` anywhere in the sources | ⭐ | **Zero** tokens across all first-party C++ sources, comments included. `tools/check_forbidden.sh` runs as the CI job `Forbidden keyword scan` — **re-verified on every push** |
+| S1 | No `new`/`delete`/`malloc`/`free`/`calloc`/`realloc` anywhere in the sources | ⭐ | **Zero** tokens across all first-party C++ sources, comments included. `tools/check_forbidden.sh` runs as the CI job `Forbidden keyword scan` — **re-verified on every push**. (The C# client's `new` is garbage-collected managed allocation, not the raw-pointer manual allocation this rule forbids) |
 | S2 | All dynamic memory via smart pointers / STL, zero leaks guaranteed by RAII | ⭐ | `std::unique_ptr` / `std::vector` / `std::string` plus RAII wrappers for sockets, the event loop and the PID file. CI re-runs all 36 unit tests under **ASan (leak detection included) + UBSan** on every push |
 
 ### 1.3 Client Application

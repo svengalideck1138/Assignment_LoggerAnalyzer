@@ -58,7 +58,10 @@ Assignment_LoggerAnalyzer/
 
 ## Quick Start (prebuilt binaries)
 
-No build step required.
+No build step required. Packaged binaries for **Linux x86_64, Linux aarch64
+and Windows x64** — each release ships with a `SHA256SUMS` file — are on the
+[Releases page](https://github.com/svengalideck1138/Assignment_LoggerAnalyzer/releases);
+the copies below live in `02.Release/` inside the repository.
 
 **Server (Linux):**
 
@@ -397,7 +400,12 @@ The assignment's strict rule (no manual memory management anywhere) is met.
 
 - **Zero** occurrences of `new` / `delete` / `malloc` / `free` / `calloc` /
   `realloc` in first-party C++ sources — both the server (`SERVER/src/`)
-  and the C++ client (`CLIENT/CPP/src/`), excluding bundled 3rdparty
+  and the C++ client (`CLIENT/CPP/src/`), excluding bundled 3rdparty —
+  re-verified on every push by the CI forbidden-keyword scan
+- Note for anyone grepping the whole repository: the C# WinForms client
+  naturally contains C#'s `new` keyword. That is **garbage-collected managed
+  allocation**, not the raw-pointer manual allocation the rule forbids —
+  the rule (and the scan) therefore applies to the C++ sources
 - All dynamic resources are owned by `std::unique_ptr`
   (`std::make_unique`) and STL containers (`std::vector`, `std::string`,
   `std::array`)
