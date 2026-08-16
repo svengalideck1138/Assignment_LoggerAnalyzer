@@ -315,13 +315,19 @@ void App::draw_transfer_section(const Snapshot& s, bool busy) {
     // 부가 정보는 오버레이 문구에만 싣는다.
     {
         char overlay[160];
+        // 과제 C1: 진행률을 퍼센트 숫자로도 보여준다.
+        const double pct = s.total_bytes > 0
+                               ? 100.0 * static_cast<double>(s.bytes_consumed) /
+                                     static_cast<double>(s.total_bytes)
+                               : 0.0;
         if (s.phase == Phase::Uploading && s.bytes_sent > s.bytes_consumed) {
-            std::snprintf(overlay, sizeof(overlay), "analyzed  %s / %s   (sent %s, %.1f MiB/s)",
+            std::snprintf(overlay, sizeof(overlay),
+                          "analyzed  %.1f%%  (%s / %s)   sent %s, %.1f MiB/s", pct,
                           human_bytes(s.bytes_consumed).c_str(),
                           human_bytes(s.total_bytes).c_str(),
                           human_bytes(s.bytes_sent).c_str(), s.send_mibps);
         } else {
-            std::snprintf(overlay, sizeof(overlay), "analyzed  %s / %s",
+            std::snprintf(overlay, sizeof(overlay), "analyzed  %.1f%%  (%s / %s)", pct,
                           human_bytes(s.bytes_consumed).c_str(),
                           human_bytes(s.total_bytes).c_str());
         }
