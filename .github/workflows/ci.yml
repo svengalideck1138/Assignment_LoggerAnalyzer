@@ -80,12 +80,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # 제너레이터를 고정하지 않는다. 러너 이미지의 VS 버전은 계속
+      # 올라가므로 ("Visual Studio 17 2022" 고정은 이미지 교체 때 깨진다),
+      # CMake 가 설치된 최신 Visual Studio 를 스스로 고르게 둔다.
       - name: C++ client build
         run: |
-          cmake -S 01.Sources/CLIENT/CPP -B client-build -G "Visual Studio 17 2022" -A x64
+          cmake --version
+          cmake -S 01.Sources/CLIENT/CPP -B client-build
           cmake --build client-build --config Release --parallel
       - name: Unit tests
         run: |
-          cmake -S 01.Sources/SERVER/tests -B tests-build -G "Visual Studio 17 2022" -A x64
+          cmake -S 01.Sources/SERVER/tests -B tests-build
           cmake --build tests-build --config Debug --parallel
           ctest --test-dir tests-build -C Debug --output-on-failure
