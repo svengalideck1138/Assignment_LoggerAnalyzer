@@ -22,6 +22,13 @@ SET(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 SET(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 SET(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 SET(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+# GLFW 3.4 는 Linux 에서 X11 과 Wayland 백엔드를 모두 빌드하려 한다.
+# Wayland 는 wayland-scanner / wayland-protocols 가 있어야 하므로,
+# 기본은 X11 만 켠다. Wayland 가 필요하면 -DGLFW_BUILD_WAYLAND=ON 으로 켠다.
+IF(UNIX AND NOT APPLE)
+    OPTION(GLFW_BUILD_WAYLAND "Build support for Wayland" OFF)
+    OPTION(GLFW_BUILD_X11 "Build support for X11" ON)
+ENDIF()
 ADD_SUBDIRECTORY(3rdparty/glfw)
 
 # ---- Dear ImGui (코어 + GLFW/OpenGL3 백엔드) ----
@@ -36,6 +43,11 @@ ADD_LIBRARY(imgui STATIC
 )
 TARGET_INCLUDE_DIRECTORIES(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 TARGET_LINK_LIBRARIES(imgui PUBLIC glfw)
+# Wayland 백엔드가 꺼져 있으면 imgui 의 GLFW 백엔드도 Wayland 네이티브 헤더를
+# 요구하지 않도록 한다 (3rdparty/imgui/backends/imgui_impl_glfw.cpp 의 LOCAL PATCH).
+IF(UNIX AND NOT APPLE AND NOT GLFW_BUILD_WAYLAND)
+    TARGET_COMPILE_DEFINITIONS(imgui PUBLIC IMGUI_IMPL_GLFW_NO_WAYLAND)
+ENDIF()
 
 FIND_PACKAGE(OpenGL REQUIRED)
 FIND_PACKAGE(Threads REQUIRED)
