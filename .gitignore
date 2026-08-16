@@ -16,6 +16,7 @@ obj/
 build/
 build-*/
 packages/
+__pycache__/
 
 # ---- OS 부스러기 ----
 Thumbs.db

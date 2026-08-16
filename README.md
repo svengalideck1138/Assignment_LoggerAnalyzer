@@ -1,5 +1,7 @@
 # Assignment_LoggerAnalyzer
 
+[![CI](https://github.com/svengalideck1138/Assignment_LoggerAnalyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/svengalideck1138/Assignment_LoggerAnalyzer/actions/workflows/ci.yml)
+
 A client-server system that uploads a large (~500MB) equipment log file over TCP,
 parses and aggregates it on the fly, and returns the analysis result as `result.csv`.
 
@@ -383,6 +385,37 @@ The assignment's strict rule (no manual memory management anywhere) is met.
   well, so every path — including error paths — releases them automatically
 - The `BYDA_SANITIZE=address` build option enables
   AddressSanitizer/UBSan verification
+
+## Verification
+
+Every push runs the [CI pipeline](.github/workflows/ci.yml); the badge at the
+top reflects the latest result. What it proves:
+
+| Check | What it demonstrates |
+|-------|----------------------|
+| **Forbidden keyword scan** | Zero `new`/`delete`/`malloc`/`calloc`/`realloc`/`free` tokens in first-party C++ sources, comments included — the assignment's strict rule S1, re-verified on every commit |
+| **36 unit tests** | All 8 rejection reasons, the module whitelist (`BeyondLimit` kill), spd range/anchor/malformed-value gates, chunk-split invariance of the line splitter, oversize-line memory guard, hourly bucketing and averages, bucket-count cap under adversarial timestamps, frame header golden vectors, truncated/forged frame defense, CSV sections and quoting |
+| **ASan + UBSan re-run** | The same tests pass under AddressSanitizer and UndefinedBehaviorSanitizer — no leaks, no out-of-bounds, no UB on the parsing paths |
+| **Disconnect e2e (P2)** | A scripted client uploads, then kills the connection with a TCP RST mid-transfer; the server must survive and complete a full follow-up session whose statistics and result.csv match the expected values exactly |
+| **Windows + Linux builds** | The C++ client and the unit tests compile and pass on both MSVC and GCC on every push |
+
+Run everything locally:
+
+```bash
+# unit tests (any platform)
+cmake -S 01.Sources/SERVER/tests -B tests-build && cmake --build tests-build
+ctest --test-dir tests-build --output-on-failure
+```
+
+```bash
+# forced-disconnect regression (Linux, server built first)
+bash 01.Sources/SERVER/tests/run_e2e.sh
+```
+
+```bash
+# forbidden keyword scan
+bash tools/check_forbidden.sh
+```
 
 ## Branch Strategy
 
