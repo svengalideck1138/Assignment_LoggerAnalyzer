@@ -1,0 +1,71 @@
+[Unit]
+Description=Zhenyu_LoggerAnalyzer Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+
+# ▼ 설치 환경에 맞게 이 네 줄만 바꾸면 된다.
+User=byda
+Group=byda
+WorkingDirectory=/opt/Zhenyu_LoggerAnalyzer/01.Sources/SERVER
+ExecStart=/opt/Zhenyu_LoggerAnalyzer/01.Sources/SERVER/build/Zhenyu_LoggerAnalyzer --foreground --port 8088
+
+# systemd 가 프로세스를 관리하므로 데몬이 스스로 fork 할 필요가 없다.
+# --foreground 로 두고 Type=simple 을 쓰는 것이 요즘 방식이다.
+# (직접 double-fork 하는 --daemon 모드도 별도로 구현되어 있다.)
+
+Restart=always
+RestartSec=5
+
+# 정리 종료: SIGTERM 을 받으면 리슨 소켓을 닫고, 진행 중인 세션을 마무리한 뒤
+# 이벤트 루프의 모든 핸들을 반환하고 나간다. 그 시간을 넉넉히 준다.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 로그는 stderr 로 나가고 journald 가 받는다.
+#   journalctl -u Zhenyu_LoggerAnalyzer -f
+StandardOutput=journal
+StandardError=journal
+
+# --- 최소 권한 ---
+# 이 서버는 특권이 전혀 필요 없다. 업로드된 로그를 디스크에 쓰지도 않는다.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
+
+# ============================================================
+#  설치 방법
+# ============================================================
+#   서버 루트에서 등록 스크립트 하나로 끝난다 (경로/계정 자동 치환):
+#     bash 03.DaemonRegistration.sh
+#
+#   손으로 하려면:
+#   sed -e "s|/opt/Zhenyu_LoggerAnalyzer/01.Sources/SERVER|$(pwd)|g" \
+#       -e "s|^User=byda|User=$USER|"  \
+#       -e "s|^Group=byda|Group=$(id -gn)|" \
+#       packaging/Zhenyu_LoggerAnalyzer.service | sudo tee /etc/systemd/system/Zhenyu_LoggerAnalyzer.service
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now Zhenyu_LoggerAnalyzer
+#
+#   # 상태 확인 / 로그
+#   systemctl status Zhenyu_LoggerAnalyzer
+#   journalctl -u Zhenyu_LoggerAnalyzer -f
+#
+#   # 중지 / 해제
+#   sudo systemctl disable --now Zhenyu_LoggerAnalyzer
+#
+# ------------------------------------------------------------
+#  systemd 가 없는 환경 (일부 WSL, 최소 컨테이너)
+# ------------------------------------------------------------
+#   systemctl 이 동작하지 않으면 서버를 직접 띄우면 된다.
+#     ./build/Zhenyu_LoggerAnalyzer --port 8088 --verbose
+#   백그라운드로 두려면 서버 자체의 데몬 모드를 쓴다.
+#     ./build/Zhenyu_LoggerAnalyzer --daemon --port 8088 --log /tmp/Zhenyu_LoggerAnalyzer.log
+# ============================================================
