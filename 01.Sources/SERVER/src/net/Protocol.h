@@ -1,7 +1,8 @@
 // Zhenyu_LoggerAnalyzer - wire protocol definition
 //
 // 이 헤더는 Linux 서버가 사용하는 와이어 포맷의 단일 진실 소스다.
-// Windows 클라이언트(C#)는 01.Sources/CLIENT/Network/Protocol.cs 에서 동일한 규약을 구현한다.
+// C# 클라이언트는 01.Sources/CLIENT/CSHARP/Network/Protocol.cs 에서 동일한 규약을 구현하고,
+// C++ ImGui 클라이언트는 이 헤더를 그대로 include 한다 (01.Sources/CLIENT/CPP).
 // 플랫폼 헤더(<winsock2.h> / <arpa/inet.h>)에 의존하지 않도록
 // 바이트 순서 변환을 직접 구현한다.
 //
