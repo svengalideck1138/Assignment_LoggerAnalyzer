@@ -126,8 +126,13 @@
 #ifndef GLFW_EXPOSE_NATIVE_X11      // for glfwGetX11Display(), glfwGetX11Window() on Freedesktop (Linux, BSD, etc.)
 #define GLFW_EXPOSE_NATIVE_X11
 #endif
+// [LOCAL PATCH] GLFW 를 X11 전용으로 빌드하면 wayland-client.h 가 없어서
+// glfw3native.h 가 컴파일되지 않는다. CMake 에서 IMGUI_IMPL_GLFW_NO_WAYLAND 를
+// 정의하면 Wayland 네이티브 접근만 빼고 X11 로 빌드한다.
+#if !defined(IMGUI_IMPL_GLFW_NO_WAYLAND)
 #ifndef GLFW_EXPOSE_NATIVE_WAYLAND
 #define GLFW_EXPOSE_NATIVE_WAYLAND
+#endif
 #endif
 #include <GLFW/glfw3native.h>
 #endif
