@@ -29,7 +29,7 @@ private:
     void draw_result_section(const Snapshot& s, bool busy);
     void draw_log_section();
 
-    void save_csv(const Snapshot& s);
+    void save_csv();
 
     TransferClient client_;
     FileBrowser browser_;
