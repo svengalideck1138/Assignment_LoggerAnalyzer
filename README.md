@@ -343,6 +343,97 @@ Both clients keep the UI responsive through a 500MB upload
   finishes in-flight sessions, then releases every libuv handle before
   exiting (`uv_loop_close` verifies zero handles remain)
 
+## Design Patterns (GoF)
+
+Patterns are applied only where they solve an actual problem in this
+system. Each one below points at the real source.
+
+### Factory Method — creation behind an interface
+
+`main.cpp` never names a concrete server type: it asks the factory and
+receives an `ITcpServer`. Swapping the transport implementation (or
+substituting a fake for a test harness) changes one line inside the
+factory, not the application. The C# client mirrors the same idea with
+`ConnectionFactory` → `IServerConnection`.
+
+```cpp
+// 01.Sources/SERVER/src/net/ServerFactory.cpp
+std::unique_ptr<ITcpServer> ServerFactory::createTcpServer(uv_loop_t* loop, const Config& cfg) {
+    return std::make_unique<TcpServer>(loop, cfg);
+}
+
+// 01.Sources/SERVER/src/main.cpp — the application only knows the interface
+std::unique_ptr<byda::ITcpServer> server = byda::ServerFactory::createTcpServer(&loop, cfg);
+```
+
+### Strategy — pluggable payload handling in the frame decoder
+
+`FrameDecoder` always decodes frames the same way, but *what happens to
+the payload bytes* is a swappable strategy (`IPayloadSink`). Small
+control frames are buffered; `UPLOAD_CHUNK` payloads are streamed
+zero-copy from the receive buffer straight into the parser. This
+strategy switch is the exact point that keeps a 500MB upload at a few
+MB of resident memory.
+
+```cpp
+// 01.Sources/SERVER/src/net/FrameDecoder.cpp
+streaming_ = (sink_ != nullptr) && sink_->stream_payload(header_.type, header_.payload_len);
+if (!streaming_) {
+    payload_.resize(static_cast<std::size_t>(header_.payload_len));  // buffer: control frames
+}
+// ...
+if (streaming_) {
+    sink_->payload_chunk(data + consumed, take);  // stream: upload chunks, zero-copy
+}
+```
+
+### Observer — lifecycle and progress notifications
+
+A session never knows its owner's concrete type. It publishes "all of
+my handles are closed" through `ISessionCallback`, and the owner reacts
+by destroying the session object at the only moment that is safe. The
+C# client uses the same pattern between threads: the worker publishes
+`UploadProgress` snapshots through `IProgress<T>`, and `Progress<T>`
+marshals every notification onto the UI thread — no `Invoke`
+boilerplate anywhere.
+
+```cpp
+// 01.Sources/SERVER/src/net/ISessionCallback.h
+class ISessionCallback {
+public:
+    // 세션이 자기 핸들을 전부 닫아, 소유자가 세션 객체를 소멸시켜도
+    // 안전해진 시점에 호출된다.
+    virtual void on_session_closed(std::uint32_t id) = 0;
+};
+```
+
+```csharp
+// 01.Sources/CLIENT/CSHARP/Form1.cs — the UI thread observes the worker
+var progress = new Progress<UploadProgress>(OnUploadProgress);
+AnalyzeResult result = await Task.Run(
+    () => conn.UploadAsync(path, progress, netLog, token), token);
+```
+
+### Facade — one small API over the whole transfer engine
+
+The ImGui UI drives a worker thread, a non-blocking socket, frame
+encoding, the cancel handshake and progress accounting through a
+handful of methods; everything else is hidden inside `TransferClient`.
+The UI never touches a socket.
+
+```cpp
+// 01.Sources/CLIENT/CPP/src/net/Transfer.h
+class TransferClient {
+public:
+    void connect(std::string host, std::uint16_t port, std::string client_name);
+    void disconnect();
+    void start_upload(std::string file_path);
+    void request_cancel() noexcept;
+    Snapshot snapshot() const;   // UI 는 매 프레임 찢어진 값 없는 복사본을 읽는다
+    // ...
+};
+```
+
 ## Memory Optimization Strategy
 
 Assignment constraint: *loading the whole 500MB file into memory at once is
@@ -422,10 +513,62 @@ top reflects the latest result. What it proves:
 | Check | What it demonstrates |
 |-------|----------------------|
 | **Forbidden keyword scan** | Zero `new`/`delete`/`malloc`/`calloc`/`realloc`/`free` tokens in first-party C++ sources, comments included — the assignment's strict rule S1, re-verified on every commit |
-| **36 unit tests** | All 8 rejection reasons, the module whitelist (`BeyondLimit` kill), spd range/anchor/malformed-value gates, chunk-split invariance of the line splitter, oversize-line memory guard, hourly bucketing and averages, bucket-count cap under adversarial timestamps, frame header golden vectors, truncated/forged frame defense, CSV sections and quoting |
+| **36 unit tests** | All 8 rejection reasons, the module whitelist (`BeyondLimit` kill), spd range/anchor/malformed-value gates, chunk-split invariance of the line splitter, oversize-line memory guard, hourly bucketing and averages, bucket-count cap under adversarial timestamps, frame header golden vectors, truncated/forged frame defense, CSV sections and quoting — full run output below |
 | **ASan + UBSan re-run** | The same tests pass under AddressSanitizer and UndefinedBehaviorSanitizer — no leaks, no out-of-bounds, no UB on the parsing paths |
-| **Disconnect e2e (P2)** | A scripted client uploads, then kills the connection with a TCP RST mid-transfer; the server must survive and complete a full follow-up session whose statistics and result.csv match the expected values exactly |
+| **Disconnect + cancel e2e (P2)** | A scripted client uploads, then kills the connection with a TCP RST mid-transfer; the server must survive and complete a full follow-up session whose statistics and result.csv match the expected values exactly. A third session cancels mid-upload with `CANCEL`, must receive `ERROR(Cancelled)`, then re-uploads **on the same connection** — pinning the cancel contract both GUI clients rely on |
 | **Windows + Linux builds** | The C++ client and the unit tests compile and pass on both MSVC and GCC on every push |
+
+### Unit test results — 36 / 36 passed
+
+The same test binary runs in three configurations: Windows (MSVC),
+Linux (GCC) and Linux under ASan + UBSan — all green in CI on every
+push. A captured local run:
+
+<details>
+<summary><b><code>byda_tests</code> — 36 test(s), 0 failure(s)</b> (click to expand)</summary>
+
+```
+[ OK ] accepts_valid_line_and_extracts_fields
+[ OK ] accepts_all_whitelisted_modules
+[ OK ] rejects_too_short
+[ OK ] rejects_missing_open_bracket
+[ OK ] rejects_bad_timestamp
+[ OK ] rejects_garbage_payload
+[ OK ] rejects_missing_close_bracket
+[ OK ] rejects_missing_byda_tag
+[ OK ] rejects_bad_module_name
+[ OK ] whitelist_shoots_down_beyondlimit
+[ OK ] spd_range_gate_is_second_defense
+[ OK ] spd_boundaries
+[ OK ] spd_anchor_is_exact
+[ OK ] spd_malformed_values_are_ignored
+[ OK ] chunk_split_invariance
+[ OK ] raw_bytes_cover_the_whole_stream
+[ OK ] carry_joins_lines_across_fragments
+[ OK ] oversize_line_is_dropped_not_accumulated
+[ OK ] oversize_across_fragments
+[ OK ] buckets_group_by_hour
+[ OK ] spd_average_min_max
+[ OK ] corrupt_lines_are_counted_not_fatal
+[ OK ] adversarial_timestamps_cannot_inflate_buckets
+[ OK ] reset_clears_everything
+[ OK ] header_encode_decode_roundtrip
+[ OK ] decodes_whole_frame
+[ OK ] decodes_frame_fed_one_byte_at_a_time
+[ OK ] decodes_two_frames_in_one_fragment
+[ OK ] rejects_bad_magic
+[ OK ] rejects_bad_version
+[ OK ] rejects_forged_giant_length
+[ OK ] truncated_header_waits_for_more
+[ OK ] payload_reader_survives_truncated_payload
+[ OK ] csv_contains_both_assignment_answers
+[ OK ] csv_disposition_counts_add_up
+[ OK ] csv_quotes_fields_with_commas
+
+36 test(s), 0 failure(s)
+```
+
+</details>
 
 Run everything locally:
 
@@ -436,7 +579,7 @@ ctest --test-dir tests-build --output-on-failure
 ```
 
 ```bash
-# forced-disconnect regression (Linux, server built first)
+# forced-disconnect + cancel regression (Linux, server built first)
 bash 01.Sources/SERVER/tests/run_e2e.sh
 ```
 
