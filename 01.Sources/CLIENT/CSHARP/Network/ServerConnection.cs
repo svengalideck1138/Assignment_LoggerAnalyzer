@@ -2,8 +2,10 @@
 //
 // - 자원 해제: Dispose 가 소켓/스트림을 즉시 닫는다. C# 판 RAII.
 // - UI 비차단: 모든 I/O 는 async — 메시지 펌프가 멈추지 않는다.
-// - 취소: NetworkStream.ReadAsync 는 토큰을 사실상 무시하므로,
-//   취소 시 소켓을 닫아 대기 중인 읽기를 깨운다.
+// - 취소: .NET Framework 의 NetworkStream.ReadAsync 는 토큰을 사실상
+//   무시하므로, 취소를 진행 중인 읽기와 경주시켜 CANCEL 프레임을 보낸다.
+//   서버의 응답(ERROR 또는 남은 결과 프레임)이 읽기를 자연스럽게 풀고,
+//   한도 안에 응답이 없을 때만 소켓을 닫아 강제로 깨운다.
 
 using System;
 using System.Globalization;
@@ -33,6 +35,24 @@ namespace Individual_Assignment01_UI.Network
         }
     }
 
+    /// <summary>
+    /// 서버/회선과 무관한 로컬 파일 문제 (없는 파일, 열기 실패, 디스크 읽기
+    /// 오류, 업로드 도중 크기 변경). UI 는 이 예외를 받으면 연결을 끊지
+    /// 않아야 한다 - 연결은 멀쩡하고, 파일만 문제이기 때문이다.
+    /// </summary>
+    internal sealed class LocalFileException : Exception
+    {
+        public LocalFileException(string message)
+            : base(message)
+        {
+        }
+
+        public LocalFileException(string message, Exception inner)
+            : base(message, inner)
+        {
+        }
+    }
+
     internal sealed class ServerConnection : IServerConnection
     {
         // 취소 후 서버 응답을 기다리는 한도. 서버가 소켓 버퍼에 남은 청크를
@@ -42,6 +62,12 @@ namespace Individual_Assignment01_UI.Network
         // 청크 하나를 쓰는 데 이보다 오래 걸리면 회선이 끊긴 것으로 본다.
         // 느린 링크(2 MiB/s)에서도 1 MiB 청크는 1초면 나가므로 넉넉한 값이다.
         private const int WriteStallTimeoutMs = 20000;
+
+        // 동기 Read (업로드 중 ACK 드레인) 의 한도. DataAvailable 은 "1바이트
+        // 이상"만 보장하므로, 프레임 뒷부분이 오지 않으면 동기 Read 가
+        // 무한정 멈출 수 있다. UPLOAD_ACK 은 100바이트 남짓이라 5초는
+        // 사실상 회선 사망 판정이다.
+        private const int SyncReadTimeoutMs = 5000;
 
         private TcpClient _client;
         private NetworkStream _stream;
@@ -110,6 +136,12 @@ namespace Individual_Assignment01_UI.Network
                 }
 
                 conn._stream = conn._client.GetStream();
+
+                // 동기 Read (ReadExactlyBlocking) 가 반쪽 프레임에서 무한정
+                // 멈추지 않도록 한도를 둔다. 비동기 ReadAsync 는 이 값의
+                // 영향을 받지 않는다.
+                conn._stream.ReadTimeout = SyncReadTimeoutMs;
+
                 conn.LocalEndpoint = conn._client.Client.LocalEndPoint.ToString();
                 conn.RemoteEndpoint = conn._client.Client.RemoteEndPoint.ToString();
 
@@ -308,7 +340,9 @@ namespace Individual_Assignment01_UI.Network
             var info = new FileInfo(path);
             if (!info.Exists)
             {
-                throw new FileNotFoundException("file not found", path);
+                // 소켓에는 아직 아무것도 보내지 않았다. 연결은 멀쩡하므로
+                // UI 가 끊어버리지 않도록 로컬 파일 예외로 구분해 던진다.
+                throw new LocalFileException("file not found: " + path);
             }
 
             long total = info.Length;
@@ -368,8 +402,22 @@ namespace Individual_Assignment01_UI.Network
             long lastLogBytes = 0;
             int chunksSinceLog = 0;
 
-            using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                                             (int)chunkSize, useAsync: true))
+            FileStream file;
+            try
+            {
+                file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                      (int)chunkSize, useAsync: true);
+            }
+            catch (Exception ex)
+            {
+                // 파일을 열지 못했다. 서버는 이미 UPLOAD_BEGIN 을 받고 청크를
+                // 기다리는 중이므로, CANCEL 로 세션을 원위치시켜 연결을 살려
+                // 둔 뒤 로컬 파일 오류로 보고한다.
+                await CancelAndDrainAsync(null, log).ConfigureAwait(false);
+                throw new LocalFileException("cannot open file: " + ex.Message, ex);
+            }
+
+            using (file)
             {
                 while (true)
                 {
@@ -378,12 +426,33 @@ namespace Individual_Assignment01_UI.Network
                     // 예외로 빠져나가, 서버가 취소를 통보받지 못한다.
                     if (ct.IsCancellationRequested)
                     {
-                        await CancelAndAwaitAckAsync(log).ConfigureAwait(false);
+                        await CancelAndDrainAsync(null, log).ConfigureAwait(false);
                         ct.ThrowIfCancellationRequested();
                     }
 
-                    int n = await file.ReadAsync(buffer, 0, buffer.Length, CancellationToken.None)
+                    // 선언한 총량까지만 읽는다. 업로드 도중 파일이 자라도
+                    // 서버가 "선언보다 많이 왔다"(SizeMismatch) 로 연결을
+                    // 끊는 일이 없다.
+                    long remaining = total - state.BytesSent;
+                    if (remaining == 0)
+                    {
+                        break;
+                    }
+                    int want = (int)Math.Min(buffer.Length, remaining);
+
+                    int n;
+                    try
+                    {
+                        n = await file.ReadAsync(buffer, 0, want, CancellationToken.None)
                                       .ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        // 디스크 읽기 오류다. 회선 문제로 위장되지 않도록
+                        // CANCEL 로 세션을 정리하고 로컬 오류로 보고한다.
+                        await CancelAndDrainAsync(null, log).ConfigureAwait(false);
+                        throw new LocalFileException("local file read error: " + ex.Message, ex);
+                    }
                     if (n <= 0)
                     {
                         break;
@@ -434,6 +503,18 @@ namespace Individual_Assignment01_UI.Network
                 progress.Report(state.Snapshot());
             }
 
+            // 2.5) 로컬 파일 이상 검사. 선언한 총량을 채우지 못하고 루프가
+            // 끝났다면 업로드 도중 파일이 줄어든 것이다. 이대로 UPLOAD_END
+            // 를 보내면 서버가 SizeMismatch 로 연결을 끊어 서버 오류처럼
+            // 보이므로, 우리가 먼저 CANCEL 로 정리하고 로컬 오류로 알린다.
+            if (state.BytesSent != total)
+            {
+                await CancelAndDrainAsync(null, log).ConfigureAwait(false);
+                throw new LocalFileException(string.Format(CultureInfo.InvariantCulture,
+                    "file changed during upload: declared {0} bytes but could only read {1}",
+                    total, state.BytesSent));
+            }
+
             // 3) UPLOAD_END
             var end = new PayloadWriter();
             end.U64((ulong)state.BytesSent);
@@ -442,9 +523,11 @@ namespace Individual_Assignment01_UI.Network
                 Wire.HumanBytes(state.BytesSent));
 
             // 4) ANALYZE_DONE 이 올 때까지 남은 프레임을 소화한다.
+            // 이 단계는 읽기만 하므로, 취소가 눌리면 읽기와 경주시켜
+            // CANCEL 을 보내야 한다 (ReadFrameOrCancelAsync).
             while (true)
             {
-                Frame f = await ReadFrameAsync(ct).ConfigureAwait(false);
+                Frame f = await ReadFrameOrCancelAsync(log, ct).ConfigureAwait(false);
 
                 if (f.Type == MsgType.UploadAck)
                 {
@@ -537,7 +620,7 @@ namespace Individual_Assignment01_UI.Network
                     "result.csv size is out of range: " + expectedSize);
             }
 
-            Frame begin = await ReadFrameAsync(ct).ConfigureAwait(false);
+            Frame begin = await ReadFrameOrCancelAsync(log, ct).ConfigureAwait(false);
             if (begin.Type == MsgType.Error)
             {
                 ThrowServerError(begin);
@@ -565,7 +648,7 @@ namespace Individual_Assignment01_UI.Network
             {
                 while (true)
                 {
-                    Frame f = await ReadFrameAsync(ct).ConfigureAwait(false);
+                    Frame f = await ReadFrameOrCancelAsync(log, ct).ConfigureAwait(false);
 
                     if (f.Type == MsgType.ResultChunk)
                     {
@@ -603,15 +686,10 @@ namespace Individual_Assignment01_UI.Network
         {
             while (_stream != null && _stream.DataAvailable)
             {
-                Frame f;
-                try
-                {
-                    f = ReadFrameBlocking();
-                }
-                catch (IOException)
-                {
-                    return;
-                }
+                // 읽기 실패(서버가 닫음, 타임아웃, 리셋)는 삼키지 않고
+                // 그대로 던진다. 여기서 삼키면 실패가 다음 쓰기까지 숨겨져
+                // 최대 한 청크 늦게, 엉뚱한 오류로 보고된다.
+                Frame f = ReadFrameBlocking();
 
                 if (f.Type == MsgType.UploadAck)
                 {
@@ -716,6 +794,13 @@ namespace Individual_Assignment01_UI.Network
             {
                 throw new ProtocolException("bad magic from server during upload");
             }
+            // 비동기 경로(ReadFrameAsync)와 같은 검증을 한다. 같은 프레임을
+            // 해석하는 두 경로의 검증이 달라지면 안 된다.
+            if (head[4] != Wire.Version)
+            {
+                throw new ProtocolException(string.Format(
+                    "unsupported protocol version from server: {0}", head[4]));
+            }
 
             var frame = new Frame();
             frame.Type = (MsgType)head[5];
@@ -798,11 +883,53 @@ namespace Individual_Assignment01_UI.Network
         }
 
         /// <summary>
-        /// CANCEL 을 보내고 서버의 ERROR(Cancelled) 응답을 짧게 기다린다.
+        /// 취소가 동작하는 프레임 읽기. NetworkStream.ReadAsync 는 .NET
+        /// Framework 에서 취소 토큰을 사실상 무시하므로, 토큰만 넘겨서는
+        /// 서버가 다음 프레임을 보낼 때까지 취소가 먹지 않는다 (분석 대기 /
+        /// 결과 수신 중 취소가 무시되고, 종료 시 창이 닫히지 않는 원인).
+        ///
+        /// 대신 진행 중인 읽기와 취소 신호를 경주시킨다. 취소가 먼저 오면
+        /// CANCEL 을 보내고 서버 응답으로 읽기를 풀어낸 뒤 (CancelAndDrainAsync)
+        /// OperationCanceledException 으로 빠져나간다.
+        /// </summary>
+        private async Task<Frame> ReadFrameOrCancelAsync(IProgress<string> log,
+                                                         CancellationToken ct)
+        {
+            Task<Frame> read = ReadFrameAsync(CancellationToken.None);
+            if (!ct.CanBeCanceled)
+            {
+                return await read.ConfigureAwait(false);
+            }
+
+            var cancelled = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            using (ct.Register(() => cancelled.TrySetResult(true)))
+            {
+                Task first = await Task.WhenAny(read, cancelled.Task).ConfigureAwait(false);
+                if (first == read)
+                {
+                    return await read.ConfigureAwait(false);
+                }
+            }
+
+            await CancelAndDrainAsync(read, log).ConfigureAwait(false);
+            throw new OperationCanceledException(ct);
+        }
+
+        /// <summary>
+        /// CANCEL 을 보낸 뒤, 서버가 프로토콜을 정리했다는 표시가 올 때까지
+        /// 밀린 프레임을 소화한다. 표시는 두 가지다:
+        ///   - ERROR: 서버가 업로드를 중단 처리했다 (세션은 Ready 로 복귀)
+        ///   - RESULT_END: 취소가 늦어 서버는 이미 분석을 끝내고 결과까지
+        ///     내보냈다. 여기까지 소화하면 연결은 다시 유휴 상태다.
         /// 보내자마자 닫으면 버퍼에 남은 청크 때문에 서버가 CANCEL 대신
         /// 연결 끊김을 보게 되어, 취소 처리와 중단 시점 통계가 실행되지 않는다.
+        ///
+        /// pendingRead 는 취소 시점에 이미 진행 중이던 읽기 (없으면 null).
+        /// 한도 안에 표시가 오지 않으면 회선이 죽은 것이므로 소켓을 닫아
+        /// 진행 중인 읽기를 강제로 깨운다.
         /// </summary>
-        private async Task CancelAndAwaitAckAsync(IProgress<string> log)
+        private async Task CancelAndDrainAsync(Task<Frame> pendingRead, IProgress<string> log)
         {
             try
             {
@@ -813,43 +940,61 @@ namespace Individual_Assignment01_UI.Network
             catch (Exception)
             {
                 // 이미 끊긴 연결이라면 알릴 방법이 없다. 정상 경로다.
+                ObserveAndDiscard(pendingRead);
                 return;
             }
 
-            using (var cts = new CancellationTokenSource(CancelAckTimeoutMs))
+            Task<Frame> read = pendingRead;
+            Task deadline = Task.Delay(CancelAckTimeoutMs);
+
+            try
             {
-                try
+                while (true)
                 {
-                    while (true)
+                    if (read == null)
                     {
-                        Frame f = await ReadFrameAsync(cts.Token).ConfigureAwait(false);
-
-                        if (f.Type == MsgType.UploadAck)
-                        {
-                            // 취소 직전까지 밀려 있던 진행 보고. 버린다.
-                            continue;
-                        }
-
-                        if (f.Type == MsgType.Error)
-                        {
-                            var r = new PayloadReader(f.Payload);
-                            ushort code;
-                            string msg;
-                            if (r.U16(out code) && r.Str16(out msg))
-                            {
-                                Log(log, "<- ERROR({0})          {1}", code, msg);
-                            }
-                            return;
-                        }
-
-                        Log(log, "<- {0} (ignored while cancelling)", Wire.Name(f.Type));
+                        read = ReadFrameAsync(CancellationToken.None);
                     }
+
+                    Task first = await Task.WhenAny(read, deadline).ConfigureAwait(false);
+                    if (first == deadline)
+                    {
+                        // 한도 안에 아무 표시도 오지 않았다 - 회선이 죽었을
+                        // 가능성이 높다. 소켓을 닫아 진행 중인 읽기를 깨우고
+                        // 연결을 정리한다 (유휴 감시 타이머가 곧 끊김을 반영한다).
+                        Log(log, "   no cancel acknowledgement - closing the connection");
+                        ObserveAndDiscard(read);
+                        Dispose();
+                        return;
+                    }
+
+                    Frame f = await read.ConfigureAwait(false);
+                    read = null;
+
+                    if (f.Type == MsgType.Error)
+                    {
+                        var r = new PayloadReader(f.Payload);
+                        ushort code;
+                        string msg;
+                        if (r.U16(out code) && r.Str16(out msg))
+                        {
+                            Log(log, "<- ERROR({0})          {1}", code, msg);
+                        }
+                        return;
+                    }
+                    if (f.Type == MsgType.ResultEnd)
+                    {
+                        Log(log, "<- RESULT_END        (analysis finished before the cancel)");
+                        return;
+                    }
+
+                    // 취소 직전까지 밀려 있던 진행 보고 / 결과 프레임. 버린다.
                 }
-                catch (Exception ex)
-                {
-                    Log(log, "   no cancel acknowledgement from the server ({0})",
-                        ex.GetType().Name);
-                }
+            }
+            catch (Exception ex)
+            {
+                Log(log, "   no cancel acknowledgement from the server ({0})",
+                    ex.GetType().Name);
             }
         }
 
