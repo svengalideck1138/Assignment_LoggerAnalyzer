@@ -24,8 +24,8 @@ Legend — ✅ met / ⭐ exceeded
 
 | ID | Requirement | Status | Implementation · Evidence |
 |---|---|:--:|---|
-| S1 | No `new`/`delete`/`malloc`/`free`/`calloc`/`realloc` anywhere in the sources | ⭐ | **Zero** tokens across all first-party C++ sources, comments included. `tools/check_forbidden.sh` runs as the CI job `Forbidden keyword scan` — **re-verified on every push** |
-| S2 | All dynamic memory via smart pointers / STL, zero leaks guaranteed by RAII | ⭐ | `std::unique_ptr` / `std::vector` / `std::string` plus RAII wrappers for sockets, the event loop and the PID file. CI re-runs all 36 unit tests under **ASan (leak detection included) + UBSan** on every push |
+| S1 | No `new`/`delete`/`malloc`/`free`/`calloc`/`realloc` anywhere in the sources | ⭐ | **Zero** tokens across all first-party C++ sources, comments included. `tools/check_forbidden.sh` runs as the CI job `Forbidden keyword scan` — **re-verified on every push**. (The C# client's `new` is garbage-collected managed allocation, not the raw-pointer manual allocation this rule forbids) |
+| S2 | All dynamic memory via smart pointers / STL, zero leaks guaranteed by RAII | ⭐ | `std::unique_ptr` / `std::vector` / `std::string` plus RAII wrappers for sockets, the event loop and the PID file. CI re-runs all 36 unit tests under **ASan (leak detection included) + UBSan** on every push. The **client** side is covered by the headless engine probe (`CLIENT/CPP/tests`): the full connect → upload → cancel → re-upload → disconnect cycle ran under ASan + LeakSanitizer against a live server with **zero leaks reported** |
 
 ### 1.3 Client Application
 
@@ -50,7 +50,7 @@ Legend — ✅ met / ⭐ exceeded
 | ID | Requirement | Status | Implementation · Evidence |
 |---|---|:--:|---|
 | P1 | ~0.001% corrupted lines must never crash the server; skip, record, finish every valid line | ⭐ | Measured: **26 corrupted lines (0.00075%) skipped, 3,483,502 lines completed, zero crashes**. Failures are classified into 8 reasons with first-occurrence excerpts reported in the CSV. Every reason, the module whitelist (`BeyondLimit` kill) and the speed range gate are pinned by unit tests and re-run under ASan/UBSan |
-| P2 | On a forced disconnect mid-transfer, both sides must survive and release resources | ⭐ | CI job `Server build + disconnect e2e`: injects a **TCP RST** mid-upload, then a follow-up session must complete with exact expected statistics; the server's clean shutdown (all libuv handles released) is asserted too. The clients add write-stall detection and RAII teardown |
+| P2 | On a forced disconnect mid-transfer, both sides must survive and release resources | ⭐ | **Server side** — CI job `Server build + disconnect e2e`: injects a **TCP RST** mid-upload, then a follow-up session must complete with exact expected statistics; a cancel-mid-upload session must be answered with `ERROR(Cancelled)` and allow a re-upload on the same connection; the server's clean shutdown (all libuv handles released) is asserted too. **Client side** — the headless engine probe (`CLIENT/CPP/tests`, `abort` mode) uploads to a live server that is then `kill -9`-ed mid-transfer: the engine must transition to a failed state without crashing and its worker thread must exit and release the socket (verified under ASan + LeakSanitizer). The GUI clients were additionally hand-verified against the live aarch64 server: 500MB upload, mid-upload cancel with same-connection re-upload, local-file errors, window close during transfer, and a server hard-killed (`SIGKILL`) at ~26% of an upload — the client reported the error without crashing and completed a reconnect + full re-upload |
 
 ### 1.6 Deliverables
 
