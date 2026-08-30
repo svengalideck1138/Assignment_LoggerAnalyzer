@@ -5,9 +5,14 @@
   1) 세션 A: 업로드 도중 RST 로 회선을 강제로 끊는다 (SO_LINGER 0).
   2) 세션 B: 같은 서버에 곧바로 다시 접속해 전체 업로드를 완주하고,
      ANALYZE_DONE 의 통계와 result.csv 가 기대값과 일치하는지 확인한다.
+  3) 세션 C: 업로드 도중 CANCEL 을 보내 ERROR(Cancelled) 를 확인한 뒤,
+     '같은 연결'에서 곧바로 재업로드를 완주한다.
 
 세션 B 가 성공하면 "전송 중 강제 절단에도 서버는 크래시 없이 자원을
-정리하고 다음 세션을 정상 처리한다"가 증명된다.
+정리하고 다음 세션을 정상 처리한다"가 증명된다. 세션 C 는 서버의 취소
+계약(TcpSession::abort_upload: 취소는 프로토콜 위반이 아니므로 세션을
+Ready 로 되돌리고 연결을 유지한다)을 회귀로 고정한다 - C#/C++ 클라이언트의
+취소 핸드셰이크가 모두 이 동작에 의존한다.
 
 의존성 없음 (표준 라이브러리만). 사용법:
   python3 e2e_disconnect.py <host> <port>
@@ -33,8 +38,11 @@ ANALYZE_DONE = 0x21
 RESULT_BEGIN = 0x31
 RESULT_CHUNK = 0x32
 RESULT_END = 0x33
+CANCEL = 0x40
 BYE = 0x7F
 ERROR = 0x7E
+
+ERR_CANCELLED = 9  # ErrorCode::Cancelled (Protocol.h)
 
 
 def fail(msg):
@@ -142,10 +150,9 @@ def abort_mid_upload(host, port, data):
     print(f"[ OK ] session A: sent {sent} bytes then reset the connection")
 
 
-def full_upload(host, port, data, expected):
-    """세션 B: 완주하고 결과를 검증한다."""
-    sock = connect_and_hello(host, port, "e2e-full")
-    chunk_size = upload_begin(sock, len(data), "full.log")
+def upload_and_verify(sock, data, expected, session, name):
+    """이미 열린 연결에서 업로드를 완주하고 통계와 result.csv 를 검증한다."""
+    chunk_size = upload_begin(sock, len(data), name)
 
     sent = 0
     while sent < len(data):
@@ -203,11 +210,55 @@ def full_upload(host, port, data, expected):
     if b"HOURLY_MODULE_COUNTS" not in csv or b"spd_average" not in csv:
         fail("result.csv is missing expected sections")
 
-    sock.sendall(frame(BYE))
-    sock.close()
-    print(f"[ OK ] session B: {lines} lines analyzed "
+    print(f"[ OK ] session {session}: {lines} lines analyzed "
           f"(accepted={accepted}, rejected={rejected}, spd_avg={avg}), "
           f"result.csv {len(csv)} bytes verified")
+
+
+def full_upload(host, port, data, expected):
+    """세션 B: 새로 접속해 완주하고 결과를 검증한다."""
+    sock = connect_and_hello(host, port, "e2e-full")
+    upload_and_verify(sock, data, expected, "B", "full.log")
+    sock.sendall(frame(BYE))
+    sock.close()
+
+
+def cancel_and_resume(host, port, data, expected):
+    """세션 C: 업로드 도중 CANCEL -> ERROR(Cancelled) -> 같은 연결에서 재업로드.
+
+    재업로드가 완주되면 취소 후 서버 세션이 Ready 로 복귀했고 연결이
+    유지됐다는 증거다.
+    """
+    sock = connect_and_hello(host, port, "e2e-cancel")
+    chunk_size = upload_begin(sock, len(data), "cancel.log")
+
+    # 절반만 보내다 취소한다.
+    half = max(1, len(data) // 2)
+    sent = 0
+    while sent < half:
+        n = min(chunk_size, half - sent)
+        sock.sendall(frame(UPLOAD_CHUNK, data[sent:sent + n]))
+        sent += n
+    sock.sendall(frame(CANCEL))
+
+    # 밀려 있던 진행 보고를 지나 ERROR(Cancelled) 가 와야 한다.
+    while True:
+        msg_type, payload = read_frame(sock)
+        if msg_type in (UPLOAD_ACK, ANALYZE_PROGRESS):
+            continue
+        if msg_type == ERROR:
+            code = struct.unpack(">H", payload[:2])[0]
+            if code != ERR_CANCELLED:
+                fail(f"expected ERROR({ERR_CANCELLED} cancelled) but got ERROR({code})")
+            break
+        fail(f"unexpected message {msg_type:#x} while waiting for the cancel ack")
+    print(f"[ OK ] session C: cancelled after {sent} bytes, "
+          f"server acknowledged (ERROR {ERR_CANCELLED})")
+
+    # 재접속 없이 같은 소켓으로 곧바로 다시 업로드한다.
+    upload_and_verify(sock, data, expected, "C", "resume.log")
+    sock.sendall(frame(BYE))
+    sock.close()
 
 
 def main():
@@ -223,7 +274,9 @@ def main():
     time.sleep(0.5)  # 서버가 죽은 세션을 정리할 시간
 
     full_upload(host, port, data, expected)
-    print("[PASS] server survived a mid-upload reset and completed the next session")
+    cancel_and_resume(host, port, data, expected)
+    print("[PASS] server survived a mid-upload reset and a mid-upload cancel, "
+          "and completed every follow-up session")
 
 
 if __name__ == "__main__":
