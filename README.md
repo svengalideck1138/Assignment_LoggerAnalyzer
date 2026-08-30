@@ -401,8 +401,8 @@ boilerplate anywhere.
 // 01.Sources/SERVER/src/net/ISessionCallback.h
 class ISessionCallback {
 public:
-    // 세션이 자기 핸들을 전부 닫아, 소유자가 세션 객체를 소멸시켜도
-    // 안전해진 시점에 호출된다.
+    // Called once the session has closed every handle it owns, i.e. at
+    // the only moment the owner can safely destroy the session object.
     virtual void on_session_closed(std::uint32_t id) = 0;
 };
 ```
@@ -429,7 +429,7 @@ public:
     void disconnect();
     void start_upload(std::string file_path);
     void request_cancel() noexcept;
-    Snapshot snapshot() const;   // UI 는 매 프레임 찢어진 값 없는 복사본을 읽는다
+    Snapshot snapshot() const;   // the UI reads a torn-free copy every frame
     // ...
 };
 ```
