@@ -122,6 +122,15 @@ namespace Individual_Assignment01_UI
                     host, port, "Zhenyu_LoggerAnalyzer/WinForms", ConnectTimeoutMs, _cts.Token)
                     .ConfigureAwait(true);
 
+                // 접속 시도 중에 창이 닫혔다면 컨트롤이 이미 파괴됐다.
+                // 방금 만든 연결만 반환하고 조용히 끝낸다.
+                if (IsDisposed || Disposing)
+                {
+                    _conn.Dispose();
+                    _conn = null;
+                    return;
+                }
+
                 HelloAck ack = _conn.Ack;
 
                 SetLed(LedState.Connected);
@@ -137,15 +146,18 @@ namespace Individual_Assignment01_UI
             }
             catch (OperationCanceledException)
             {
+                // 창이 닫히면서 취소된 경우, 이미 파괴된 컨트롤을 만지면 안 된다.
+                DropConnection();
+                if (IsDisposed || Disposing) { return; }
                 AppendLog("connect cancelled");
                 SetStatus("Cancelled");
-                DropConnection();
             }
             catch (TimeoutException ex)
             {
+                DropConnection();
+                if (IsDisposed || Disposing) { return; }
                 AppendLog("[TIMEOUT] " + ex.Message);
                 SetStatus("Connect timed out");
-                DropConnection();
                 SetLed(LedState.Failed);
                 MessageBox.Show(this, ex.Message, "Connect failed",
                                 MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -153,9 +165,10 @@ namespace Individual_Assignment01_UI
             catch (SocketException ex)
             {
                 // 서버가 안 떠 있거나 방화벽에 막힌 전형적인 경우.
+                DropConnection();
+                if (IsDisposed || Disposing) { return; }
                 AppendLog(string.Format("[SOCKET {0}] {1}", ex.SocketErrorCode, ex.Message));
                 SetStatus("Connect failed: " + ex.SocketErrorCode);
-                DropConnection();
                 SetLed(LedState.Failed);
                 MessageBox.Show(this,
                     ex.Message + Environment.NewLine + Environment.NewLine +
@@ -164,18 +177,20 @@ namespace Individual_Assignment01_UI
             }
             catch (ProtocolException ex)
             {
+                DropConnection();
+                if (IsDisposed || Disposing) { return; }
                 AppendLog("[PROTOCOL] " + ex.Message);
                 SetStatus("Protocol error");
-                DropConnection();
                 SetLed(LedState.Failed);
                 MessageBox.Show(this, ex.Message, "Protocol error",
                                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
+                DropConnection();
+                if (IsDisposed || Disposing) { return; }
                 AppendLog("[ERROR] " + ex.GetType().Name + ": " + ex.Message);
                 SetStatus("Connect failed");
-                DropConnection();
                 SetLed(LedState.Failed);
                 MessageBox.Show(this, ex.Message, "Connect failed",
                                 MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -183,7 +198,10 @@ namespace Individual_Assignment01_UI
             finally
             {
                 _busy = false;
-                UpdateUiState();
+                if (!IsDisposed && !Disposing)
+                {
+                    UpdateUiState();
+                }
             }
         }
 
@@ -211,11 +229,14 @@ namespace Individual_Assignment01_UI
             finally
             {
                 DropConnection();
-                SetLed(LedState.Idle);
-                SetStatus("Disconnected");
-                AppendLog("disconnected");
                 _busy = false;
-                UpdateUiState();
+                if (!IsDisposed && !Disposing)
+                {
+                    SetLed(LedState.Idle);
+                    SetStatus("Disconnected");
+                    AppendLog("disconnected");
+                    UpdateUiState();
+                }
             }
         }
 
@@ -236,7 +257,10 @@ namespace Individual_Assignment01_UI
             UpdateUiState();
         }
 
-        /// <summary>연결 자원을 즉시 반환한다. 여러 번 불려도 안전하다.</summary>
+        /// <summary>
+        /// 연결 자원을 즉시 반환한다. 여러 번 불려도, 창이 이미 파괴된 뒤에
+        /// 불려도 안전하다 (컨트롤은 살아 있을 때만 만진다).
+        /// </summary>
         private void DropConnection()
         {
             if (_conn != null)
@@ -248,6 +272,11 @@ namespace Individual_Assignment01_UI
             {
                 _cts.Dispose();
                 _cts = null;
+            }
+
+            if (IsDisposed || Disposing)
+            {
+                return;
             }
             SetLed(LedState.Idle);
 
@@ -392,6 +421,18 @@ namespace Individual_Assignment01_UI
                 AppendLog("upload cancelled");
                 SetStatus("Upload cancelled");
             }
+            catch (LocalFileException ex)
+            {
+                // 파일 문제일 뿐 연결은 멀쩡하다 (전송 엔진이 CANCEL 로 세션을
+                // 원위치시켰다). 여기서 MarkConnectionLost 를 부르면 살아 있는
+                // 연결을 끊어버리게 된다.
+                ResetProgress();
+                EndLiveGrid("failed");
+                AppendLog("[FILE] " + ex.Message);
+                SetStatus("Upload failed: local file error");
+                MessageBox.Show(this, ex.Message, "Upload failed",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
             catch (ProtocolException ex)
             {
                 ResetProgress();
@@ -404,7 +445,7 @@ namespace Individual_Assignment01_UI
             }
             catch (Exception ex)
             {
-                // 회선이 끊겼거나 파일을 읽지 못한 경우. 크래시 없이 정리한다.
+                // 회선이 끊긴 경우. 크래시 없이 정리한다.
                 ResetProgress();
                 EndLiveGrid("failed");
                 AppendLog("[ERROR] " + ex.GetType().Name + ": " + ex.Message);
