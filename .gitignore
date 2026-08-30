@@ -15,7 +15,11 @@ bin/
 obj/
 build/
 build-*/
+tests-build/
+tests-asan/
+probe-build/
 packages/
+__pycache__/
 
 # ---- OS 부스러기 ----
 Thumbs.db

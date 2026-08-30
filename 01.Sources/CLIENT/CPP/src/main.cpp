@@ -11,7 +11,7 @@
 
 #include <cstdio>
 
-#include "ui/App.hpp"
+#include "ui/App.h"
 
 namespace {
 

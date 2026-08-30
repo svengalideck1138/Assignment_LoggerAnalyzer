@@ -1,4 +1,4 @@
-#include "FileBrowser.hpp"
+#include "FileBrowser.h"
 
 #include <imgui.h>
 
@@ -255,7 +255,11 @@ bool FileBrowser::draw() {
     bool confirmed = false;
     bool keep_open = true;
     if (!ImGui::BeginPopupModal(title_.c_str(), &keep_open)) {
-        if (!keep_open) {
+        // 팝업이 실제로 열려 있지 않다. 제목줄 X 는 keep_open 으로,
+        // Esc 는 IsPopupOpen 으로만 알 수 있다. 여기서 visible_ 을 함께
+        // 내리지 않으면 Esc 로 닫은 뒤에도 매 프레임 이 함수가 좀비처럼
+        // SetNextWindow* 를 호출하며 '논리적으로 열린' 상태로 남는다.
+        if (!keep_open || !ImGui::IsPopupOpen(title_.c_str())) {
             visible_ = false;
         }
         return false;

@@ -1,12 +1,13 @@
-#include "Transfer.hpp"
+#include "Transfer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 
-#include "Payload.hpp"
+#include "Payload.h"
 
 namespace bydacli {
 namespace {
@@ -115,12 +116,12 @@ void TransferClient::connect(std::string host, std::uint16_t port,
     cancel_.store(false, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(cmd_mu_);
-        cmd_ = Cmd::None;
-        cmd_file_.clear();
+        cmds_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(mu_);
         state_ = Snapshot{};
+        csv_.clear();
     }
     worker_ = std::thread(&TransferClient::run_session, this, std::move(host), port,
                           std::move(client_name));
@@ -128,20 +129,33 @@ void TransferClient::connect(std::string host, std::uint16_t port,
 
 void TransferClient::disconnect() {
     std::lock_guard<std::mutex> lk(cmd_mu_);
-    cmd_ = Cmd::Disconnect;
+    // 아직 시작하지 않은 업로드보다 해제가 우선한다. 큐에 남겨 두면
+    // 500MB 업로드를 다 마친 뒤에야 끊게 된다.
+    cmds_.clear();
+    cmds_.push_back(Command{Cmd::Disconnect, {}});
     cmd_cv_.notify_all();
 }
 
 void TransferClient::start_upload(std::string file_path) {
+    // 새 업로드를 시작하므로 이전 업로드를 향했던 취소 플래그를 여기서
+    // 내린다. 워커가 명령을 집어드는 시점에 내리면, 큐에 넣은 '뒤'에 누른
+    // Cancel 까지 함께 지워져 사용자의 취소가 유실된다. 여기서 내리면
+    // 그 Cancel 은 남아서 업로드가 시작하자마자 취소된다.
+    cancel_.store(false, std::memory_order_relaxed);
+
     std::lock_guard<std::mutex> lk(cmd_mu_);
-    cmd_ = Cmd::Upload;
-    cmd_file_ = std::move(file_path);
+    cmds_.push_back(Command{Cmd::Upload, std::move(file_path)});
     cmd_cv_.notify_all();
 }
 
 Snapshot TransferClient::snapshot() const {
     std::lock_guard<std::mutex> lk(mu_);
     return state_;
+}
+
+std::string TransferClient::csv_copy() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return csv_;
 }
 
 std::vector<std::string> TransferClient::drain_log() {
@@ -247,6 +261,22 @@ std::string server_error_text(const std::vector<std::uint8_t>& payload) {
     return "server error " + std::to_string(code) + ": " + msg;
 }
 
+// payload 없는 프레임(CANCEL, BYE)을 '취소 무시' 플래그로 보낸다.
+//
+// 이 두 프레임은 취소 플래그가 켜진 상태에서 보내야 하는 프레임이다.
+// send_frame 은 cancel_ 을 송신 중단 조건으로 넘기므로, 그대로 쓰면
+// 송신이 시작도 하기 전에 "cancelled" 로 중단되어 프레임이 서버에
+// 도착하지 못한다. CANCEL 이 유실되면 서버는 Uploading 상태로 남아
+// 다음 UPLOAD_BEGIN 이 프로토콜 위반(unexpected message)이 된다.
+bool send_empty_frame_never_cancel(TcpSocket& sock, byda::MsgType type, std::string& err) {
+    byda::FrameHeader h;
+    h.type = type;
+    h.payload_len = 0;
+    byda::HeaderBytes head{};
+    byda::encode_header(h, head);
+    return sock.send_all(head.data(), head.size(), kWriteStallTimeoutMs, g_never_cancel, err);
+}
+
 }  // namespace
 
 // --------------------------------------------------------------- handshake
@@ -320,27 +350,29 @@ void TransferClient::run_session(std::string host, std::uint16_t port,
     // ---- 명령 루프: 업로드 / 해제 요청과 소켓 생존을 함께 살핀다 ----
     bool alive = true;
     while (alive) {
-        Cmd cmd = Cmd::None;
-        std::string file;
+        bool has_cmd = false;
+        Command cmd;
         {
             std::unique_lock<std::mutex> lk(cmd_mu_);
             cmd_cv_.wait_for(lk, std::chrono::milliseconds(kIdleSliceMs),
-                             [this] { return cmd_ != Cmd::None; });
-            cmd = cmd_;
-            file = cmd_file_;
-            cmd_ = Cmd::None;
-            cmd_file_.clear();
+                             [this] { return !cmds_.empty(); });
+            if (!cmds_.empty()) {
+                cmd = std::move(cmds_.front());
+                cmds_.pop_front();
+                has_cmd = true;
+            }
         }
 
-        if (cmd == Cmd::Disconnect) {
-            (void)send_frame(sock, byda::MsgType::Bye, {}, err);
+        if (has_cmd && cmd.kind == Cmd::Disconnect) {
+            // 취소 직후 Disconnect 를 눌러도 BYE 는 나가야 하므로
+            // '취소 무시' 송신을 쓴다.
+            (void)send_empty_frame_never_cancel(sock, byda::MsgType::Bye, err);
             log("-> BYE               disconnected");
             break;
         }
 
-        if (cmd == Cmd::Upload) {
-            cancel_.store(false, std::memory_order_relaxed);
-            alive = do_upload(sock, file);
+        if (has_cmd && cmd.kind == Cmd::Upload) {
+            alive = do_upload(sock, cmd.file);
             continue;
         }
 
@@ -409,7 +441,9 @@ void TransferClient::apply_upload_ack(const Frame& f) {
 
 void TransferClient::send_cancel_and_wait(TcpSocket& sock) {
     std::string err;
-    if (!send_frame(sock, byda::MsgType::Cancel, {}, err)) {
+    // send_frame 이 아니라 '취소 무시' 송신을 써야 한다. cancel_ 이 켜진
+    // 상태에서 send_frame 을 쓰면 CANCEL 송신 자체가 중단된다.
+    if (!send_empty_frame_never_cancel(sock, byda::MsgType::Cancel, err)) {
         return;  // 이미 끊긴 연결이라면 알릴 방법이 없다. 정상 경로다.
     }
     log("-> CANCEL            waiting for the server to acknowledge");
@@ -459,6 +493,7 @@ bool TransferClient::do_upload(TcpSocket& sock, const std::string& file_path) {
         fresh.hello_valid = true;
         fresh.connected = connected;
         state_ = std::move(fresh);
+        csv_.clear();
     }
 
     // ---- 0) 파일 확인 ----
@@ -563,8 +598,17 @@ bool TransferClient::do_upload(TcpSocket& sock, const std::string& file_path) {
             return true;  // 서버는 세션을 Ready 로 되돌린다. 연결 유지.
         }
 
+        // 선언한 총량까지만 읽는다. 업로드 도중 파일이 자라도 서버가
+        // "선언보다 많이 왔다"(SizeMismatch) 로 연결을 끊는 일이 없다.
+        const std::uint64_t remaining = total - sent;
+        if (remaining == 0) {
+            break;
+        }
+        const std::size_t want =
+            static_cast<std::size_t>(std::min<std::uint64_t>(chunk_size, remaining));
+
         file.read(reinterpret_cast<char*>(buf.data() + byda::kHeaderSize),
-                  static_cast<std::streamsize>(chunk_size));
+                  static_cast<std::streamsize>(want));
         const std::streamsize n = file.gcount();
         if (n <= 0) {
             break;
@@ -630,6 +674,23 @@ bool TransferClient::do_upload(TcpSocket& sock, const std::string& file_path) {
             log(line);
             last_log_bytes = sent;
         }
+    }
+
+    // ---- 2.5) 로컬 파일 이상 검사 ----
+    // 선언한 총량을 채우지 못하고 루프가 끝났다면 서버가 아니라 이쪽
+    // 문제다: 디스크 읽기 오류(badbit), 또는 업로드 도중 파일이 줄어든
+    // 경우다. 이대로 UPLOAD_END 를 보내면 서버가 SizeMismatch 로 연결을
+    // 끊어 "server error 5" 로 잘못 보고되므로, 우리가 먼저 CANCEL 로
+    // 세션을 원위치시키고 로컬 오류로 정확히 알린다. 연결은 유지된다.
+    if (file.bad() || sent != total) {
+        const std::string why =
+            file.bad() ? "local file read error after " + human_bytes(sent)
+                       : "file changed during upload: declared " + human_bytes(total) +
+                             " but could only read " + human_bytes(sent);
+        send_cancel_and_wait(sock);
+        set_phase(Phase::Connected);
+        log("[ERROR] " + why + " - upload aborted, connection stays open");
+        return true;
     }
 
     // ---- 3) UPLOAD_END ----
@@ -774,7 +835,10 @@ bool TransferClient::receive_result(TcpSocket& sock, std::uint64_t expected_size
         }
         if (f.type == byda::MsgType::ResultChunk) {
             csv.append(reinterpret_cast<const char*>(f.payload.data()), f.payload.size());
-            if (csv.size() > kMaxCsvBytes) {
+            // declared 는 위에서 kMaxCsvBytes 이하로 검증됐다. 쌓는 도중에도
+            // 선언한 크기를 넘어서는 순간 바로 끊어, 조작된 스트림이 상한까지
+            // 메모리를 채우는 일을 막는다.
+            if (csv.size() > declared) {
                 err = "result.csv exceeded the declared size";
                 return false;
             }
@@ -800,7 +864,8 @@ bool TransferClient::receive_result(TcpSocket& sock, std::uint64_t expected_size
     log("<- RESULT_END        received " + std::to_string(csv.size()) + " bytes");
 
     std::lock_guard<std::mutex> lk(mu_);
-    state_.csv = std::move(csv);
+    state_.csv_size = csv.size();
+    csv_ = std::move(csv);
     return true;
 }
 

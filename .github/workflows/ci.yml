@@ -1,0 +1,95 @@
+# 모든 push / PR 에서 실행되는 검증 파이프라인.
+#
+#   forbidden-scan : 과제 절대 제약 S1 (new/delete/malloc 금지) 전수 스캔
+#   unit-tests     : 파서/집계/프로토콜 유닛 테스트 36종 + ASan/UBSan 재실행
+#   server-e2e     : 서버 실빌드 + 업로드 중 강제절단 회귀 (평가 기준 P2)
+#   client-linux   : C++ ImGui 클라이언트 Linux 빌드
+#   windows        : C++ 클라이언트 + 유닛 테스트 Windows(MSVC) 빌드/실행
+#
+# Linux 잡의 산출물(x86_64 서버/클라이언트 바이너리)은 아티팩트로 남는다.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  forbidden-scan:
+    name: Forbidden keyword scan (S1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tools/check_forbidden.sh
+
+  unit-tests:
+    name: Unit tests + ASan/UBSan (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run (Debug)
+        run: |
+          cmake -S 01.Sources/SERVER/tests -B tests-build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build tests-build -j
+          ctest --test-dir tests-build --output-on-failure
+      - name: Re-run under AddressSanitizer + UBSan
+        run: |
+          cmake -S 01.Sources/SERVER/tests -B tests-asan -DTEST_SANITIZE=ON
+          cmake --build tests-asan -j
+          ./tests-asan/byda_tests
+
+  server-e2e:
+    name: Server build + disconnect e2e (P2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bundled libuv for this runner
+        run: bash 01.Sources/SERVER/3rdparty/libuv/build_linux.sh
+      - name: Build server
+        run: |
+          cmake -S 01.Sources/SERVER -B 01.Sources/SERVER/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build 01.Sources/SERVER/build -j
+      - name: Forced-disconnect regression
+        run: bash 01.Sources/SERVER/tests/run_e2e.sh
+      - name: Upload x86_64 server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-x86_64
+          path: 01.Sources/SERVER/build/Zhenyu_LoggerAnalyzer
+
+  client-linux:
+    name: C++ client build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install X11/OpenGL dev packages
+        run: sudo apt-get update && sudo apt-get install -y xorg-dev libgl1-mesa-dev
+      - name: Build
+        run: |
+          cmake -S 01.Sources/CLIENT/CPP -B client-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build client-build -j
+      - name: Upload x86_64 client binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-linux-x86_64
+          path: client-build/Zhenyu_LoggerClient
+
+  windows:
+    name: Windows build + unit tests (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 제너레이터를 고정하지 않는다. 러너 이미지의 VS 버전은 계속
+      # 올라가므로 ("Visual Studio 17 2022" 고정은 이미지 교체 때 깨진다),
+      # CMake 가 설치된 최신 Visual Studio 를 스스로 고르게 둔다.
+      - name: C++ client build
+        run: |
+          cmake --version
+          cmake -S 01.Sources/CLIENT/CPP -B client-build
+          cmake --build client-build --config Release --parallel
+      - name: Unit tests
+        run: |
+          cmake -S 01.Sources/SERVER/tests -B tests-build
+          cmake --build tests-build --config Debug --parallel
+          ctest --test-dir tests-build -C Debug --output-on-failure

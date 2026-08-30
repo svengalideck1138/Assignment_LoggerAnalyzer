@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-#include "Socket.hpp"
+#include "Socket.h"
 
 namespace bydacli {
 
@@ -93,8 +93,10 @@ struct Snapshot {
     std::uint64_t result_elapsed_ms = 0;
     std::uint64_t result_peak_rss_kb = 0;
 
-    // 수신한 result.csv 원문 (업로드 성공 이후에만 채워진다).
-    std::string csv;
+    // 수신한 result.csv 의 크기 (업로드 성공 이후에만 0 이 아니다).
+    // 본문은 매 프레임 복사되는 스냅샷에 싣지 않고 TransferClient 가
+    // 따로 보관한다. 저장할 때만 csv_copy() 로 가져간다.
+    std::uint64_t csv_size = 0;
 };
 
 class TransferClient {
@@ -121,6 +123,9 @@ public:
 
     Snapshot snapshot() const;
 
+    // 마지막 업로드가 남긴 result.csv 본문의 복사본. 없으면 빈 문자열.
+    std::string csv_copy() const;
+
     // 워커가 쌓아 둔 로그 줄을 가져간다 (가져간 줄은 큐에서 사라진다).
     std::vector<std::string> drain_log();
 
@@ -130,7 +135,12 @@ private:
         std::vector<std::uint8_t> payload;
     };
 
-    enum class Cmd { None, Upload, Disconnect };
+    enum class Cmd { Upload, Disconnect };
+
+    struct Command {
+        Cmd kind = Cmd::Disconnect;
+        std::string file;  // Upload 일 때만 사용
+    };
 
     void run_session(std::string host, std::uint16_t port, std::string client_name);
 
@@ -153,13 +163,16 @@ private:
 
     mutable std::mutex mu_;
     Snapshot state_;                    // mu_ 로 보호
+    std::string csv_;                   // mu_ 로 보호. 마지막 result.csv 본문
     std::deque<std::string> log_;       // mu_ 로 보호
 
     // ---- 명령 큐 (UI -> 워커) ----
+    // 단일 슬롯이 아니라 큐다. 워커가 깨기 전(최대 200ms)에 명령이 연달아
+    // 들어와도 서로 덮어쓰지 않는다. Disconnect 는 대기 중인 업로드보다
+    // 우선한다 (disconnect() 가 큐를 비우고 들어간다).
     std::mutex cmd_mu_;
     std::condition_variable cmd_cv_;
-    Cmd cmd_ = Cmd::None;
-    std::string cmd_file_;
+    std::deque<Command> cmds_;
 
     std::thread worker_;
     std::atomic<bool> busy_{false};

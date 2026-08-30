@@ -1,4 +1,4 @@
-#include "App.hpp"
+#include "App.h"
 
 #include <imgui.h>
 
@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <fstream>
 
-#include "../net/Payload.hpp"
+#include "../net/Payload.h"
 
 namespace bydacli {
 
@@ -315,13 +315,19 @@ void App::draw_transfer_section(const Snapshot& s, bool busy) {
     // 부가 정보는 오버레이 문구에만 싣는다.
     {
         char overlay[160];
+        // 과제 C1: 진행률을 퍼센트 숫자로도 보여준다.
+        const double pct = s.total_bytes > 0
+                               ? 100.0 * static_cast<double>(s.bytes_consumed) /
+                                     static_cast<double>(s.total_bytes)
+                               : 0.0;
         if (s.phase == Phase::Uploading && s.bytes_sent > s.bytes_consumed) {
-            std::snprintf(overlay, sizeof(overlay), "analyzed  %s / %s   (sent %s, %.1f MiB/s)",
+            std::snprintf(overlay, sizeof(overlay),
+                          "analyzed  %.1f%%  (%s / %s)   sent %s, %.1f MiB/s", pct,
                           human_bytes(s.bytes_consumed).c_str(),
                           human_bytes(s.total_bytes).c_str(),
                           human_bytes(s.bytes_sent).c_str(), s.send_mibps);
         } else {
-            std::snprintf(overlay, sizeof(overlay), "analyzed  %s / %s",
+            std::snprintf(overlay, sizeof(overlay), "analyzed  %.1f%%  (%s / %s)", pct,
                           human_bytes(s.bytes_consumed).c_str(),
                           human_bytes(s.total_bytes).c_str());
         }
@@ -410,7 +416,7 @@ void App::draw_result_section(const Snapshot& s, bool busy) {
     const bool transferring = s.phase == Phase::Uploading ||
                               s.phase == Phase::WaitingAnalysis ||
                               s.phase == Phase::ReceivingResult;
-    const bool has_csv = !s.csv.empty() && !transferring;
+    const bool has_csv = s.csv_size > 0 && !transferring;
     const float buttons_w = em(6.0f) + em(9.0f) + ImGui::GetStyle().ItemSpacing.x * 2;
     ImGui::BeginDisabled(!has_csv);
     ImGui::SetNextItemWidth(-buttons_w);
@@ -422,7 +428,7 @@ void App::draw_result_section(const Snapshot& s, bool busy) {
     }
     ImGui::SameLine();
     if (ImGui::Button("Save result.csv", ImVec2(em(9.0f), 0))) {
-        save_csv(s);
+        save_csv();
     }
     ImGui::EndDisabled();
 
@@ -431,7 +437,17 @@ void App::draw_result_section(const Snapshot& s, bool busy) {
     }
 }
 
-void App::save_csv(const Snapshot& s) {
+void App::save_csv() {
+    // csv 본문은 매 프레임 복사되는 스냅샷에 싣지 않으므로 (수 KB ~ 최대
+    // 64MiB 를 프레임마다 복사하는 낭비 방지), 저장하는 이 시점에만
+    // 한 번 복사해 온다.
+    const std::string csv = client_.csv_copy();
+    if (csv.empty()) {
+        save_note_ = "no result to save yet";
+        save_note_error_ = true;
+        return;
+    }
+
     const fs::path out = fs::u8path(save_path_.data());
     std::ofstream f(out, std::ios::binary | std::ios::trunc);
     if (!f) {
@@ -439,14 +455,14 @@ void App::save_csv(const Snapshot& s) {
         save_note_error_ = true;
         return;
     }
-    f.write(s.csv.data(), static_cast<std::streamsize>(s.csv.size()));
+    f.write(csv.data(), static_cast<std::streamsize>(csv.size()));
     f.close();
     if (!f) {
         save_note_ = "write failed: " + std::string(save_path_.data());
         save_note_error_ = true;
         return;
     }
-    save_note_ = "saved " + std::to_string(s.csv.size()) + " bytes to " +
+    save_note_ = "saved " + std::to_string(csv.size()) + " bytes to " +
                  std::string(save_path_.data());
     save_note_error_ = false;
 }

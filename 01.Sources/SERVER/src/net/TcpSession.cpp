@@ -557,6 +557,20 @@ bool TcpSession::handle_upload_end() {
                      kv.second);
     }
 
+    // 과제 P1의 "스킵 및 로그 기록": 훼손 라인을 사유별로 서버 로그에도
+    // 남긴다 (건수 + 첫 사례의 라인 번호/오프셋/원문 발췌). 훼손은 전체의
+    // 0.001% 수준이라 로그 비용은 사실상 없다. 전체 목록은 result.csv 의
+    // 진단 섹션에 있다.
+    for (std::size_t i = 1; i < kReasonCount; ++i) {
+        const CorruptSample& c = agg_.corrupt()[i];
+        if (c.count == 0) {
+            continue;
+        }
+        spdlog::warn("session {} corrupted x{} ({}): first at line {} offset {}: \"{}\"", id_,
+                     c.count, reason_key(static_cast<Reason>(i)), c.first_line_no,
+                     c.first_byte_offset, c.excerpt);
+    }
+
     PayloadWriter w;
     w.u64(upload_received_);
     w.u64(agg_.total_lines());
