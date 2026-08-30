@@ -261,6 +261,22 @@ std::string server_error_text(const std::vector<std::uint8_t>& payload) {
     return "server error " + std::to_string(code) + ": " + msg;
 }
 
+// payload 없는 프레임(CANCEL, BYE)을 '취소 무시' 플래그로 보낸다.
+//
+// 이 두 프레임은 취소 플래그가 켜진 상태에서 보내야 하는 프레임이다.
+// send_frame 은 cancel_ 을 송신 중단 조건으로 넘기므로, 그대로 쓰면
+// 송신이 시작도 하기 전에 "cancelled" 로 중단되어 프레임이 서버에
+// 도착하지 못한다. CANCEL 이 유실되면 서버는 Uploading 상태로 남아
+// 다음 UPLOAD_BEGIN 이 프로토콜 위반(unexpected message)이 된다.
+bool send_empty_frame_never_cancel(TcpSocket& sock, byda::MsgType type, std::string& err) {
+    byda::FrameHeader h;
+    h.type = type;
+    h.payload_len = 0;
+    byda::HeaderBytes head{};
+    byda::encode_header(h, head);
+    return sock.send_all(head.data(), head.size(), kWriteStallTimeoutMs, g_never_cancel, err);
+}
+
 }  // namespace
 
 // --------------------------------------------------------------- handshake
@@ -348,7 +364,9 @@ void TransferClient::run_session(std::string host, std::uint16_t port,
         }
 
         if (has_cmd && cmd.kind == Cmd::Disconnect) {
-            (void)send_frame(sock, byda::MsgType::Bye, {}, err);
+            // 취소 직후 Disconnect 를 눌러도 BYE 는 나가야 하므로
+            // '취소 무시' 송신을 쓴다.
+            (void)send_empty_frame_never_cancel(sock, byda::MsgType::Bye, err);
             log("-> BYE               disconnected");
             break;
         }
@@ -423,7 +441,9 @@ void TransferClient::apply_upload_ack(const Frame& f) {
 
 void TransferClient::send_cancel_and_wait(TcpSocket& sock) {
     std::string err;
-    if (!send_frame(sock, byda::MsgType::Cancel, {}, err)) {
+    // send_frame 이 아니라 '취소 무시' 송신을 써야 한다. cancel_ 이 켜진
+    // 상태에서 send_frame 을 쓰면 CANCEL 송신 자체가 중단된다.
+    if (!send_empty_frame_never_cancel(sock, byda::MsgType::Cancel, err)) {
         return;  // 이미 끊긴 연결이라면 알릴 방법이 없다. 정상 경로다.
     }
     log("-> CANCEL            waiting for the server to acknowledge");
