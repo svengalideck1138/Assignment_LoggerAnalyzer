@@ -34,9 +34,10 @@ Assignment_LoggerAnalyzer/
 │   │       ├── build_windows.bat    # VS2022 build
 │   │       ├── build_linux.sh       # Linux build (checks X11/OpenGL deps)
 │   │       ├── 3rdparty/        # Dear ImGui 1.92 + GLFW 3.4, vendored as source only
-│   │       └── src/
-│   │           ├── net/         # RAII sockets, worker-thread transfer engine
-│   │           └── ui/          # ImGui panels, built-in file browser
+│   │       ├── src/
+│   │       │   ├── net/         # RAII sockets, worker-thread transfer engine
+│   │       │   └── ui/          # ImGui panels, built-in file browser
+│   │       └── tests/           # headless engine probe (cancel/abort, ASan+LSan)
 │   └── SERVER/                  # Linux server source (CMake project)
 │       ├── 01.PreInstallation.sh    # 1) install build tools, SSH, firewall setup
 │       ├── 02.build_project_linux.sh # 2) build libuv + build server + run
@@ -52,7 +53,7 @@ Assignment_LoggerAnalyzer/
 └── 02.Release/
     ├── release - client/
     │   ├── CSHARP/              # prebuilt Windows client (.exe)
-    │   └── CPP/linux-aarch64/   # prebuilt Linux ImGui client (aarch64)
+    │   └── CPP/                 # prebuilt ImGui client (windows-x64, linux-aarch64)
     └── release - server/        # prebuilt Linux server (aarch64) + service file
 ```
 
@@ -76,6 +77,10 @@ chmod +x Zhenyu_LoggerAnalyzer
 Run `02.Release/release - client/CSHARP/Individual Assignment01_UI.exe`,
 enter the server IP and port (default 8088), and connect.
 
+**Client (Windows, C++ ImGui):**
+
+Run `02.Release/release - client/CPP/windows-x64/Zhenyu_LoggerClient.exe`.
+
 **Client (Linux, C++ ImGui):**
 
 ```bash
@@ -90,10 +95,6 @@ chmod +x Zhenyu_LoggerClient
 > The prebuilt Linux binaries are aarch64 (built on Raspberry Pi OS, glibc
 > 2.38). On any other architecture or an older glibc, build from source — the
 > build scripts install what they need; see below.
-
-> There is no prebuilt Windows binary for the C++ client yet — build it in
-> about a minute; see
-> [Client — C++ ImGui](#client--c-imgui-windows-and-linux) below.
 
 > If the server runs on another machine, open TCP port 8088 in its firewall
 > (`01.PreInstallation.sh` sets up the ufw rule automatically).
@@ -516,6 +517,7 @@ top reflects the latest result. What it proves:
 | **36 unit tests** | All 8 rejection reasons, the module whitelist (`BeyondLimit` kill), spd range/anchor/malformed-value gates, chunk-split invariance of the line splitter, oversize-line memory guard, hourly bucketing and averages, bucket-count cap under adversarial timestamps, frame header golden vectors, truncated/forged frame defense, CSV sections and quoting — full run output below |
 | **ASan + UBSan re-run** | The same tests pass under AddressSanitizer and UndefinedBehaviorSanitizer — no leaks, no out-of-bounds, no UB on the parsing paths |
 | **Disconnect + cancel e2e (P2)** | A scripted client uploads, then kills the connection with a TCP RST mid-transfer; the server must survive and complete a full follow-up session whose statistics and result.csv match the expected values exactly. A third session cancels mid-upload with `CANCEL`, must receive `ERROR(Cancelled)`, then re-uploads **on the same connection** — pinning the cancel contract both GUI clients rely on |
+| **Client engine probe (ASan + LSan)** | The C++ transfer engine runs headless against a live server under AddressSanitizer + LeakSanitizer: connect → cancel mid-upload → re-upload on the same connection → disconnect (zero leaks), and a second run where the server is `kill -9`-ed mid-upload — the engine must report the failure without crashing and release its worker/socket resources. This extends the leak-zero and robustness proof to the **client** side of rule S2 / criterion P2 |
 | **Windows + Linux builds** | The C++ client and the unit tests compile and pass on both MSVC and GCC on every push |
 
 ### Unit test results — 36 / 36 passed
@@ -581,6 +583,13 @@ ctest --test-dir tests-build --output-on-failure
 ```bash
 # forced-disconnect + cancel regression (Linux, server built first)
 bash 01.Sources/SERVER/tests/run_e2e.sh
+```
+
+```bash
+# client engine probe under ASan+LSan (Linux, server running on :8890)
+cmake -S 01.Sources/CLIENT/CPP/tests -B probe-build -DPROBE_SANITIZE=ON
+cmake --build probe-build
+./probe-build/engine_probe 127.0.0.1 8890 cancel 256   # then: abort 256
 ```
 
 ```bash

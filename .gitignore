@@ -17,6 +17,7 @@ build/
 build-*/
 tests-build/
 tests-asan/
+probe-build/
 packages/
 __pycache__/
 
